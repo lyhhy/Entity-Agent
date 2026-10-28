@@ -1,0 +1,56 @@
+# Environment variables (API keys)
+.env
+.env.*
+!.env.example
+
+# Plain-text API keys accidentally committed to the tree
+api_key.txt
+eval/api_key.txt
+
+# spaCy model wheel (561 MB) – too large for GitHub (100 MB file limit).
+# Re-create with: python -m spacy download en_core_web_lg
+*.whl
+en_core_web_lg/  # downloaded model – regenerate with: python -m spacy download en_core_web_lg
+
+# HotpotQA dataset (45 MB) – fetch with: python eval/download_hotpot.py
+eval/data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test / eval outputs
+eval/results/
+eval/logs/
+eval/diag/
+eval/*.json        # unless tracked intentionally
+
+# Logs
+*.log
+
+# Scratch / one-off debug scripts
+scratch_*.py
+debug_q*.py
+
+# Local launcher scripts that may embed machine-specific paths or secrets
+*.cmd
+eval/run_4_conditions.ps1

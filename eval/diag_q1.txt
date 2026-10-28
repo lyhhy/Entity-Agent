@@ -1,0 +1,280 @@
+﻿python : 17:01:32 [INFO] Step1.5: query relations = {'verb': [], 'obj': ['city'], 'subj': ['population', 'aquino'], 'pr
+eps': []}
+所在位置 C:\Users\zsf\AppData\Local\Temp\ps-script-4598952d-c131-4084-a5a6-804efd1180ba.ps1:101 字符: 1
++ python c:/Users/zsf/Desktop/lyh/StenRAG/eval/diag_q1_aquino.py 2>&1 | ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (17:01:32 [INFO]...], 'preps': []}:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+17:01:37 [INFO] No device provided, using cpu
+17:01:38 [INFO] Loading SentenceTransformer model from sentence-transformers/all-MiniLM-L6-v2.
+17:01:38 [INFO] Loading faiss with AVX2 support.
+17:01:38 [INFO] Could not load library with AVX2 support due to:
+ModuleNotFoundError("No module named 'faiss.swigfaiss_avx2'")
+17:01:38 [INFO] Loading faiss.
+17:01:38 [INFO] Successfully loaded faiss.
+17:01:46 [INFO] Step1.5: query relations = {'verb': [], 'obj': ['city'], 'subj': ['population', 'aquino'], 'preps': []}
+17:01:46 [INFO] Sparse mode: L1 cids 7→4, sids 8→3 (required=['description', 'other', 'population'])
+# Q1: What was the estimated population of the city that Luis Villalta Aquino was from in 2012?
+# Gold: 102,984
+
+
+================================================================================
+## MODE = LEGACY
+================================================================================
+
+### (1) Attribute mounts of population-bearing sentences
+  sid=s_0033: " As of the 2010 census the city's population was 99,845, with an estimated population of 102,984 as of 2012."
+    mount entity='2010' attr='other' w=0.5
+    mount entity='99,845' attr='other' w=0.5
+    mount entity='102,984' attr='other' w=0.5
+    mount entity='2012' attr='other' w=0.5
+  sid=s_0039: ' As of the 2010 census, the city had a population of 24,283, with an estimated population of 24,950 in 2013.'
+    mount entity='2010' attr='other' w=0.5
+    mount entity='24,283' attr='other' w=0.5
+    mount entity='24,950' attr='other' w=0.5
+    mount entity='2013' attr='other' w=0.5
+
+### (2) Hyperedge triggers per container (he_allowed)
+
+### (3) Step trace (L1/L2/S7/S10)
+  A-entity containers (touching 'Aquino', 'Pompano'):
+    cid=c_0001 entity='luis villalta aquino'                             sentences=1
+      sid=s_0001 text='Luis Villalta Aquino (October 2, 1969, Lima, Peru 鈥?March 3, 2004, Pompano Beach, Florida) was a professional boxer, who'
+    cid=c_0006 entity='pompano beach'                                    sentences=2
+      sid=s_0001 text='Luis Villalta Aquino (October 2, 1969, Lima, Peru 鈥?March 3, 2004, Pompano Beach, Florida) was a professional boxer, who'
+      sid=s_0031 text='Pompano Beach is a city in Broward County, Florida, United States, along the coast of the Atlantic Ocean just to the nor'
+  step4_b_containers: 125
+  step4_l2_cids_filtered: 7
+  step4_l2_sids_filtered: 8
+  step6_pool_size: 12
+  step7_top_n_sids (10):
+      s_0001: 'Luis Villalta Aquino (October 2, 1969, Lima, Peru 鈥?March 3, 2004, Pompano Beach, Florida) was a professional boxer, who was nicknamed "El Puma" during his care'
+    鈽?s_0033: " As of the 2010 census the city's population was 99,845, with an estimated population of 102,984 as of 2012."
+    鈻?s_0039: ' As of the 2010 census, the city had a population of 24,283, with an estimated population of 24,950 in 2013.'
+      s_0021: " The city's estimated population in 2015 was 600,155."
+      s_0020: ' Ranked by estimated 2014 population, Milwaukee was the 31st largest city in the United States.'
+      s_0014: ' As of the 2010 census the population was 97,618, and in 2015 the estimated population was 101,643, making it the second largest city in the state, after Albuqu'
+      s_0003: ' The estimated population was 7,931 in 2014, up from 7,655 in the 2010 census.'
+      s_0023: ' It is also part of the larger Milwaukee-Racine-Waukesha combined statistical area, which had an estimated population of 2,026,243 in the 2010 census.'
+      s_0034: ' It is a principal city of the Miami metropolitan area, which was home to an estimated 6,012,331 people at the 2015 census.'
+      s_0018: 'Milwaukee ( , ) is the largest city in the state of Wisconsin and the fifth-largest city in the Midwestern United States.'
+  step10_final_sids (8):
+      s_0001: 'Luis Villalta Aquino (October 2, 1969, Lima, Peru 鈥?March 3, 2004, Pompano Beach, Florida) was a professional boxer, who was nicknamed "El Puma" during his care'
+    鈽?s_0033: " As of the 2010 census the city's population was 99,845, with an estimated population of 102,984 as of 2012."
+    鈻?s_0039: ' As of the 2010 census, the city had a population of 24,283, with an estimated population of 24,950 in 2013.'
+      s_0021: " The city's estimated population in 2015 was 600,155."
+      s_0020: ' Ranked by estimated 2014 population, Milwaukee was the 31st largest city in the United States.'
+      s_0014: ' As of the 2010 census the population was 97,618, and in 2015 the estimated population was 101,643, making it the second largest city in the state, after Albuqu'
+      s_0003: ' The estimated population was 7,931 in 2014, up from 7,655 in the 2010 census.'
+      s_0023: ' It is also part of the larger Milwaukee-Racine-Waukesha combined statistical area, which had an estimated population of 2,026,243 in the 2010 census.'
+  final_answer: ['s_0001', 's_0033', 's_0039', 's_0021', 's_0020']
+
+================================================================================
+## MODE = SPARSE
+================================================================================
+
+### (1) Attribute mounts of population-bearing sentences
+  sid=s_0033: " As of the 2010 census the city's population was 99,845, with an estimated population of 102,984 as of 2012."
+    mount entity='2010' attr='other' w=0.5
+    mount entity='99,845' attr='other' w=0.5
+    mount entity='102,984' attr='other' w=0.5
+    mount entity='2012' attr='other' w=0.5
+  sid=s_0039: ' As of the 2010 census, the city had a population of 24,283, with an estimated population of 24,950 in 2013.'
+    mount entity='2010' attr='other' w=0.5
+    mount entity='24,283' attr='other' w=0.5
+    mount entity='24,950' attr='other' w=0.5
+    mount entity='2013' attr='other' w=0.5
+
+### (2) Hyperedge triggers per container (he_allowed)
+  he=h_0001 cid=c_0001  entity='luis villalta aquino'                    triggers=['career']
+    sid=s_0001 mounts={'career'} intersect_he={'career'}  text='Luis Villalta Aquino (October 2, 1969, Lima, Peru 鈥?March 3, 2004, Pompano Beach, Florida) was a professional boxer, who'
+  he=h_0001 cid=c_0002  entity='october 2, 1969'                         triggers=['career']
+    sid=s_0001 mounts={'other'} intersect_he=set()  text='Luis Villalta Aquino (October 2, 1969, Lima, Peru 鈥?March 3, 2004, Pompano Beach, Florida) was a professional boxer, who'
+  he=h_0001 cid=c_0003  entity='lima'                                    triggers=['career']
+    sid=s_0001 mounts={'other'} intersect_he=set()  text='Luis Villalta Aquino (October 2, 1969, Lima, Peru 鈥?March 3, 2004, Pompano Beach, Florida) was a professional boxer, who'
+  he=h_0001 cid=c_0004  entity='peru'                                    triggers=['career']
+    sid=s_0001 mounts={'other'} intersect_he=set()  text='Luis Villalta Aquino (October 2, 1969, Lima, Peru 鈥?March 3, 2004, Pompano Beach, Florida) was a professional boxer, who'
+  he=h_0001 cid=c_0005  entity='march 3, 2004'                           triggers=['career']
+    sid=s_0001 mounts={'other'} intersect_he=set()  text='Luis Villalta Aquino (October 2, 1969, Lima, Peru 鈥?March 3, 2004, Pompano Beach, Florida) was a professional boxer, who'
+  he=h_0001 cid=c_0006  entity='pompano beach'                           triggers=['career', 'location']
+    sid=s_0001 mounts={'other'} intersect_he=set()  text='Luis Villalta Aquino (October 2, 1969, Lima, Peru 鈥?March 3, 2004, Pompano Beach, Florida) was a professional boxer, who'
+    sid=s_0031 mounts={'location'} intersect_he={'location'}  text='Pompano Beach is a city in Broward County, Florida, United States, along the coast of the Atlantic Ocean just to the nor'
+  he=h_0001 cid=c_0007  entity='florida'                                 triggers=['career', 'location']
+    sid=s_0001 mounts={'other'} intersect_he=set()  text='Luis Villalta Aquino (October 2, 1969, Lima, Peru 鈥?March 3, 2004, Pompano Beach, Florida) was a professional boxer, who'
+    sid=s_0031 mounts={'location'} intersect_he={'location'}  text='Pompano Beach is a city in Broward County, Florida, United States, along the coast of the Atlantic Ocean just to the nor'
+  he=h_0001 cid=c_0008  entity='el puma'                                 triggers=['career']
+    sid=s_0001 mounts={'other'} intersect_he=set()  text='Luis Villalta Aquino (October 2, 1969, Lima, Peru 鈥?March 3, 2004, Pompano Beach, Florida) was a professional boxer, who'
+  he=h_0002 cid=c_0009  entity='pismo beach'                             triggers=['location']
+  he=h_0002 cid=c_0010  entity='san luis obispo county'                  triggers=['location']
+  he=h_0002 cid=c_0011  entity='central coast'                           triggers=['location']
+  he=h_0002 cid=c_0012  entity='california'                              triggers=['location']
+  he=h_0002 cid=c_0013  entity='united states'                           triggers=['location']
+  he=h_0002 cid=c_0015  entity='2014'                                    triggers=['location', 'population']
+  he=h_0002 cid=c_0017  entity='2010'                                    triggers=['location', 'population']
+    sid=s_0033 mounts={'other'} intersect_he=set()  text=" As of the 2010 census the city's population was 99,845, with an estimated population of 102,984 as of 2012."
+    sid=s_0039 mounts={'other'} intersect_he=set()  text=' As of the 2010 census, the city had a population of 24,283, with an estimated population of 24,950 in 2013.'
+  he=h_0003 cid=c_0027  entity='fort wayne'                              triggers=['location', 'population']
+  he=h_0003 cid=c_0028  entity='u.s.'                                    triggers=['location']
+  he=h_0003 cid=c_0029  entity='indiana'                                 triggers=['location', 'population']
+  he=h_0003 cid=c_0030  entity='allen county'                            triggers=['location']
+  he=h_0003 cid=c_0031  entity='18'                                      triggers=['location']
+  he=h_0003 cid=c_0032  entity='ohio'                                    triggers=['location']
+  he=h_0003 cid=c_0033  entity='50'                                      triggers=['location']
+  he=h_0003 cid=c_0034  entity='michigan'                                triggers=['location']
+  he=h_0003 cid=c_0035  entity='264,488'                                 triggers=['location', 'population']
+  he=h_0003 cid=c_0036  entity='2016'                                    triggers=['location', 'population']
+  he=h_0003 cid=c_0037  entity='77th'                                    triggers=['location', 'population']
+  he=h_0003 cid=c_0038  entity='the united states'                       triggers=['location', 'population']
+  he=h_0003 cid=c_0039  entity='second'                                  triggers=['location', 'population']
+  he=h_0003 cid=c_0040  entity='indianapolis'                            triggers=['location', 'population']
+  he=h_0003 cid=c_0041  entity='allen, wells'                            triggers=['location', 'population']
+  he=h_0003 cid=c_0042  entity='whitley'                                 triggers=['location', 'population']
+  he=h_0003 cid=c_0043  entity='419,453'                                 triggers=['location', 'population']
+  he=h_0003 cid=c_0044  entity='2011'                                    triggers=['location', 'population']
+  he=h_0003 cid=c_0045  entity='three'                                   triggers=['population']
+  he=h_0003 cid=c_0046  entity='adams, dekalb'                           triggers=['population']
+  he=h_0003 cid=c_0047  entity='huntington'                              triggers=['population']
+  he=h_0003 cid=c_0048  entity='noble'                                   triggers=['population']
+  he=h_0003 cid=c_0049  entity='steuben'                                 triggers=['population']
+  he=h_0003 cid=c_0050  entity='615,077'                                 triggers=['population']
+  he=h_0004 cid=c_0051  entity='las cruces'                              triggers=['location', 'population']
+  he=h_0004 cid=c_0052  entity='the city of the crosses'                 triggers=['location']
+  he=h_0004 cid=c_0053  entity='do帽a ana county'                         triggers=['location']
+  he=h_0004 cid=c_0054  entity='new mexico'                              triggers=['location']
+  he=h_0004 cid=c_0038  entity='the united states'                       triggers=['location', 'population']
+  he=h_0004 cid=c_0017  entity='2010'                                    triggers=['location', 'population']
+    sid=s_0033 mounts={'other'} intersect_he=set()  text=" As of the 2010 census the city's population was 99,845, with an estimated population of 102,984 as of 2012."
+    sid=s_0039 mounts={'other'} intersect_he=set()  text=' As of the 2010 census, the city had a population of 24,283, with an estimated population of 24,950 in 2013.'
+  he=h_0004 cid=c_0055  entity='97,618'                                  triggers=['location', 'population']
+  he=h_0004 cid=c_0056  entity='2015'                                    triggers=['location', 'population']
+  he=h_0004 cid=c_0057  entity='101,643'                                 triggers=['location', 'population']
+  he=h_0004 cid=c_0039  entity='second'                                  triggers=['location', 'population']
+  he=h_0004 cid=c_0058  entity='albuquerque'                             triggers=['location', 'population']
+  he=h_0004 cid=c_0059  entity='213,676'                                 triggers=['population']
+  he=h_0004 cid=c_0015  entity='2014'                                    triggers=['location', 'population']
+  he=h_0004 cid=c_0060  entity='el paso'                                 triggers=['location']
+  he=h_0005 cid=c_0061  entity='milwaukee'                               triggers=['location']
+  he=h_0005 cid=c_0062  entity='wisconsin'                               triggers=['location']
+  he=h_0005 cid=c_0063  entity='fifth'                                   triggers=['location']
+  he=h_0005 cid=c_0064  entity='the midwestern united states'            triggers=['location', 'population']
+  he=h_0005 cid=c_0065  entity='milwaukee county'                        triggers=['location', 'population']
+  he=h_0005 cid=c_0015  entity='2014'                                    triggers=['location', 'population']
+  he=h_0005 cid=c_0067  entity='31st'                                    triggers=['location', 'population']
+  he=h_0005 cid=c_0056  entity='2015'                                    triggers=['location', 'population']
+  he=h_0005 cid=c_0069  entity='2,026,243'                               triggers=['population']
+  he=h_0005 cid=c_0017  entity='2010'                                    triggers=['location', 'population']
+    sid=s_0033 mounts={'other'} intersect_he=set()  text=" As of the 2010 census the city's population was 99,845, with an estimated population of 102,984 as of 2012."
+    sid=s_0039 mounts={'other'} intersect_he=set()  text=' As of the 2010 census, the city had a population of 24,283, with an estimated population of 24,950 in 2013.'
+  he=h_0006 cid=c_0070  entity='bowling green'                           triggers=['location']
+  he=h_0006 cid=c_0071  entity='warren county'                           triggers=['location']
+  he=h_0006 cid=c_0072  entity='kentucky'                                triggers=['location']
+  he=h_0006 cid=c_0064  entity='the midwestern united states'            triggers=['location', 'population']
+  he=h_0006 cid=c_0092  entity='the midwestern united states (group 2)'  triggers=['location']
+  he=h_0006 cid=c_0036  entity='2016'                                    triggers=['location', 'population']
+  he=h_0006 cid=c_0073  entity='65,234'                                  triggers=['location', 'population']
+  he=h_0006 cid=c_0074  entity='third'                                   triggers=['location', 'population']
+  he=h_0006 cid=c_0075  entity='louisville'                              triggers=['location', 'population']
+  he=h_0006 cid=c_0076  entity='lexington'                               triggers=['location', 'population']
+  he=h_0006 cid=c_0077  entity='165,732'                                 triggers=['location', 'population']
+  he=h_0006 cid=c_0078  entity='glasgow'                                 triggers=['location', 'population']
+  he=h_0006 cid=c_0079  entity='218,870'                                 triggers=['location', 'population']
+  he=h_0007 cid=c_0080  entity='320,434'                                 triggers=['location', 'population']
+  he=h_0007 cid=c_0015  entity='2014'                                    triggers=['location', 'population']
+  he=h_0007 cid=c_0081  entity='eighth'                                  triggers=['location', 'population']
+  he=h_0007 cid=c_0082  entity='texas'                                   triggers=['location', 'population']
+  he=h_0007 cid=c_0083  entity='corpus christi'                          triggers=['population']
+  he=h_0007 cid=c_0084  entity='442,600'                                 triggers=['population']
+  he=h_0007 cid=c_0087  entity='2013'                                    triggers=['population']
+    sid=s_0039 mounts={'other'} intersect_he=set()  text=' As of the 2010 census, the city had a population of 24,283, with an estimated population of 24,950 in 2013.'
+  he=h_0007 cid=c_0063  entity='fifth'                                   triggers=['location']
+  he=h_0007 cid=c_0064  entity='the midwestern united states'            triggers=['location', 'population']
+  he=h_0008 cid=c_0006  entity='pompano beach'                           triggers=['career', 'location']
+    sid=s_0001 mounts={'other'} intersect_he=set()  text='Luis Villalta Aquino (October 2, 1969, Lima, Peru 鈥?March 3, 2004, Pompano Beach, Florida) was a professional boxer, who'
+    sid=s_0031 mounts={'location'} intersect_he={'location'}  text='Pompano Beach is a city in Broward County, Florida, United States, along the coast of the Atlantic Ocean just to the nor'
+  he=h_0008 cid=c_0091  entity='broward county'                          triggers=['location']
+    sid=s_0031 mounts={'location'} intersect_he={'location'}  text='Pompano Beach is a city in Broward County, Florida, United States, along the coast of the Atlantic Ocean just to the nor'
+  he=h_0008 cid=c_0007  entity='florida'                                 triggers=['career', 'location']
+    sid=s_0001 mounts={'other'} intersect_he=set()  text='Luis Villalta Aquino (October 2, 1969, Lima, Peru 鈥?March 3, 2004, Pompano Beach, Florida) was a professional boxer, who'
+    sid=s_0031 mounts={'location'} intersect_he={'location'}  text='Pompano Beach is a city in Broward County, Florida, United States, along the coast of the Atlantic Ocean just to the nor'
+  he=h_0008 cid=c_0093  entity='the midwestern united states (group 3)'  triggers=['location']
+    sid=s_0031 mounts=set() intersect_he=set()  text='Pompano Beach is a city in Broward County, Florida, United States, along the coast of the Atlantic Ocean just to the nor'
+  he=h_0008 cid=c_0064  entity='the midwestern united states'            triggers=['location', 'population']
+  he=h_0008 cid=c_0094  entity='the atlantic ocean'                      triggers=['location']
+    sid=s_0031 mounts={'other'} intersect_he=set()  text='Pompano Beach is a city in Broward County, Florida, United States, along the coast of the Atlantic Ocean just to the nor'
+  he=h_0008 cid=c_0095  entity='fort lauderdale'                         triggers=['location']
+    sid=s_0031 mounts={'location'} intersect_he={'location'}  text='Pompano Beach is a city in Broward County, Florida, United States, along the coast of the Atlantic Ocean just to the nor'
+  he=h_0008 cid=c_0017  entity='2010'                                    triggers=['location', 'population']
+    sid=s_0033 mounts={'other'} intersect_he=set()  text=" As of the 2010 census the city's population was 99,845, with an estimated population of 102,984 as of 2012."
+    sid=s_0039 mounts={'other'} intersect_he=set()  text=' As of the 2010 census, the city had a population of 24,283, with an estimated population of 24,950 in 2013.'
+  he=h_0008 cid=c_0101  entity='miami'                                   triggers=['location', 'population']
+  he=h_0008 cid=c_0102  entity='an estimated 6,012,331'                  triggers=['location', 'population']
+  he=h_0008 cid=c_0056  entity='2015'                                    triggers=['location', 'population']
+  he=h_0009 cid=c_0103  entity='san luis potos铆'                         triggers=['location']
+  he=h_0009 cid=c_0104  entity='slp'                                     triggers=['location']
+  he=h_0009 cid=c_0105  entity='san luis'                                triggers=['location']
+  he=h_0009 cid=c_0106  entity='mexican'                                 triggers=['location']
+  he=h_0009 cid=c_0108  entity='735,886'                                 triggers=['location', 'population']
+  he=h_0009 cid=c_0109  entity='approximately 1,021,688'                 triggers=['location', 'population']
+  he=h_0009 cid=c_0110  entity='soledad de graciano s谩nchez'             triggers=['location', 'population']
+  he=h_0009 cid=c_0111  entity='greater san'                             triggers=['location', 'population']
+  he=h_0009 cid=c_0112  entity='luis potos铆'                             triggers=['location', 'population']
+  he=h_0009 cid=c_0113  entity='eleventh'                                triggers=['location', 'population']
+  he=h_0009 cid=c_0114  entity='mexico'                                  triggers=['location', 'population']
+  he=h_0010 cid=c_0115  entity='ardmore'                                 triggers=['location', 'population']
+  he=h_0010 cid=c_0116  entity='carter county'                           triggers=['location']
+  he=h_0010 cid=c_0117  entity='oklahoma'                                triggers=['location']
+  he=h_0010 cid=c_0064  entity='the midwestern united states'            triggers=['location', 'population']
+  he=h_0010 cid=c_0134  entity='the midwestern united states (group 2)'  triggers=['location']
+  he=h_0010 cid=c_0017  entity='2010'                                    triggers=['location', 'population']
+    sid=s_0033 mounts={'other'} intersect_he=set()  text=" As of the 2010 census the city's population was 99,845, with an estimated population of 102,984 as of 2012."
+    sid=s_0039 mounts={'other'} intersect_he=set()  text=' As of the 2010 census, the city had a population of 24,283, with an estimated population of 24,950 in 2013.'
+  he=h_0010 cid=c_0087  entity='2013'                                    triggers=['population']
+    sid=s_0039 mounts={'other'} intersect_he=set()  text=' As of the 2010 census, the city had a population of 24,283, with an estimated population of 24,950 in 2013.'
+  he=h_0010 cid=c_0120  entity='48,491'                                  triggers=['population']
+  he=h_0010 cid=c_0121  entity='90 mi'                                   triggers=['location']
+  he=h_0010 cid=c_0122  entity='oklahoma city'                           triggers=['location']
+  he=h_0010 cid=c_0123  entity='dallas'                                  triggers=['location']
+  he=h_0010 cid=c_0124  entity='fort worth'                              triggers=['location']
+  he=h_0010 cid=c_0082  entity='texas'                                   triggers=['location', 'population']
+  he=h_0010 cid=c_0125  entity='interstate 35'                           triggers=['location']
+  he=h_0010 cid=c_0028  entity='u.s.'                                    triggers=['location']
+  he=h_0010 cid=c_0126  entity='70'                                      triggers=['location']
+  he=h_0010 cid=c_0127  entity='ten'                                     triggers=['location']
+  he=h_0010 cid=c_0128  entity='south central oklahoma'                  triggers=['location']
+  he=h_0010 cid=c_0129  entity='arbuckle country'                        triggers=['location']
+  he=h_0010 cid=c_0130  entity='lake and trail country'                  triggers=['location']
+  he=h_0010 cid=c_0131  entity='9 mi south'                              triggers=['location']
+  he=h_0010 cid=c_0132  entity='the arbuckle mountains'                  triggers=['location']
+  he=h_0010 cid=c_0133  entity='the healdton basin'                      triggers=['location']
+  he=h_0010 cid=c_0135  entity='the midwestern united states (group 3)'  triggers=['location']
+
+### (3) Step trace (L1/L2/S7/S10)
+  A-entity containers (touching 'Aquino', 'Pompano'):
+    cid=c_0001 entity='luis villalta aquino'                             sentences=1
+      sid=s_0001 text='Luis Villalta Aquino (October 2, 1969, Lima, Peru 鈥?March 3, 2004, Pompano Beach, Florida) was a professional boxer, who'
+    cid=c_0006 entity='pompano beach'                                    sentences=2
+      sid=s_0001 text='Luis Villalta Aquino (October 2, 1969, Lima, Peru 鈥?March 3, 2004, Pompano Beach, Florida) was a professional boxer, who'
+      sid=s_0031 text='Pompano Beach is a city in Broward County, Florida, United States, along the coast of the Atlantic Ocean just to the nor'
+  step4_b_containers: 125
+  step4_l2_cids_filtered: 4
+  step4_l2_sids_filtered: 3
+  step6_pool_size: 7
+  step7_top_n_sids (7):
+      s_0001: 'Luis Villalta Aquino (October 2, 1969, Lima, Peru 鈥?March 3, 2004, Pompano Beach, Florida) was a professional boxer, who was nicknamed "El Puma" during his care'
+    鈽?s_0033: " As of the 2010 census the city's population was 99,845, with an estimated population of 102,984 as of 2012."
+      s_0021: " The city's estimated population in 2015 was 600,155."
+      s_0020: ' Ranked by estimated 2014 population, Milwaukee was the 31st largest city in the United States.'
+      s_0018: 'Milwaukee ( , ) is the largest city in the state of Wisconsin and the fifth-largest city in the Midwestern United States.'
+      s_0031: 'Pompano Beach is a city in Broward County, Florida, United States, along the coast of the Atlantic Ocean just to the north of Fort Lauderdale.'
+      s_0029: ' The Port of Corpus Christi is the fifth-largest in the United States.'
+  step10_final_sids (8):
+      s_0001: 'Luis Villalta Aquino (October 2, 1969, Lima, Peru 鈥?March 3, 2004, Pompano Beach, Florida) was a professional boxer, who was nicknamed "El Puma" during his care'
+    鈽?s_0033: " As of the 2010 census the city's population was 99,845, with an estimated population of 102,984 as of 2012."
+      s_0021: " The city's estimated population in 2015 was 600,155."
+      s_0020: ' Ranked by estimated 2014 population, Milwaukee was the 31st largest city in the United States.'
+      s_0023: ' It is also part of the larger Milwaukee-Racine-Waukesha combined statistical area, which had an estimated population of 2,026,243 in the 2010 census.'
+      s_0018: 'Milwaukee ( , ) is the largest city in the state of Wisconsin and the fifth-largest city in the Midwestern United States.'
+      s_0031: 'Pompano Beach is a city in Broward County, Florida, United States, along the coast of the Atlantic Ocean just to the north of Fort Lauderdale.'
+      s_0029: ' The Port of Corpus Christi is the fifth-largest in the United States.'
+  final_answer: ['s_0001', 's_0033', 's_0021', 's_0020', 's_0023']
