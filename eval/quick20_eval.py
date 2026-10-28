@@ -24,7 +24,7 @@ import sys
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # PHASE-E3: force HF / sentence-transformers to use local cache only.
 # The model is already downloaded at
@@ -935,11 +935,93 @@ def _select_two_entities(
     "group N" suffixes so that "Falling Stars (video game) (group 2)"
     collapses to "falling stars" and doesn't get filtered out as a
     no-hit entity when the question only mentions "Falling Stars".
+
+    Inlined from the former `eval/hyperedge_eval.py` so that this
+    module stays self-contained.
     """
-    from eval.hyperedge_eval import (
-        _select_two_entities_from_question as _orig_select,
-    )
-    return _orig_select(question, container_manager)
+    q_lower = question.lower()
+    # Collect candidate container entities (longest first).
+    candidates = []
+    seen = set()
+    for c in container_manager.get_all_containers():
+        e = (c.entity or "").strip()
+        if not e or e in seen:
+            continue
+        seen.add(e)
+        candidates.append(e)
+    candidates.sort(key=lambda x: -len(x))
+
+    # Precompute normalised labels for fast subspan check.
+    norm_map: Dict[str, str] = {c: _normalize_entity_label(c) for c in candidates}
+
+    chosen: List[str] = []
+    used_norm: set = set()
+    for cand in candidates:
+        if cand.lower() not in q_lower:
+            continue
+        cand_norm = norm_map[cand]
+        if not cand_norm:
+            continue
+        # Skip if the candidate's normalised form is already used
+        # ("Falling Stars (group 2)" vs "Falling Stars" both collapse).
+        if cand_norm in used_norm:
+            continue
+        # Skip if the candidate is a strict subspan of an already-chosen
+        # entity's normalised form.
+        subspan_of_prior = any(
+            cand_norm in prior_norm and prior_norm != cand_norm
+            for prior_norm in used_norm
+        )
+        if subspan_of_prior:
+            continue
+        # Reverse: a previously chosen entity is a strict subspan of the
+        # candidate.  Replace the shorter one with the longer one.
+        reverse_drop: Optional[int] = None
+        for idx, prior in enumerate(chosen):
+            prior_norm = norm_map[prior]
+            if prior_norm in cand_norm and prior_norm != cand_norm:
+                reverse_drop = idx
+                break
+        if reverse_drop is not None:
+            dropped = chosen[reverse_drop]
+            used_norm.discard(norm_map[dropped])
+            chosen[reverse_drop] = cand
+            used_norm.add(cand_norm)
+            continue
+        chosen.append(cand)
+        used_norm.add(cand_norm)
+        if len(chosen) >= 2:
+            break
+    return chosen
+
+
+def _normalize_entity_label(label: str) -> str:
+    """
+    Reduce an entity string to its "core noun phrase" for the purpose
+    of de-duplicating multi-form variants of the same referent.
+
+    Examples
+    --------
+    >>> _normalize_entity_label("Falling Stars (video game) (group 2)")
+    'falling stars'
+    >>> _normalize_entity_label("American Beauty (1999 film)")
+    'american beauty'
+    >>> _normalize_entity_label("John Francis Kelly")
+    'john francis kelly'
+    """
+    if not label:
+        return ""
+    s = label.lower().strip()
+    # Strip one or more parenthesised tails.
+    s = re.sub(r"\s*\([^)]*\)\s*", " ", s)
+    # Collapse "group N" / "part N" / "volume N" suffixes.
+    s = re.sub(r"\b(group|part|volume|vol|chapter|section)\s+\d+\b",
+               " ", s)
+    # Strip year-style tail as a backstop.
+    s = re.sub(r"\b\d{4}\b", " ", s)
+    # Collapse whitespace.
+    s = " ".join(s.split())
+    return s
 
 
 def _build_bridge_sids(
@@ -1110,10 +1192,6 @@ def _run_hyperedge_compare(
         # Re-run the LLM extraction with the augmented context.
         try:
             from src.llm_client import DeepSeekClient as _DSC
-            from eval.hotpot_eval import (
-                _strip_parens, _strip_colon_prefix,
-                _short_answer_gating, _coref_pick,
-            )
             # Use the same span-extraction prompt as
             # extract_answer_from_dispatch by simulating a DispatchResult.
             class _FakeRes:
