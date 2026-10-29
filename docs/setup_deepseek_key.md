@@ -1,38 +1,52 @@
-# DeepSeek API Key 设置（一次性，永久生效）
+# LLM API Key 设置
 
-## 在 PowerShell 里执行（一次）
+`src/llm_client.py` 现在会**自动加载仓库根目录的 `.env`**（首次调用
+`make_client()` 时）。不需要再手动 `load_dotenv()`，也不需要往
+PowerShell 里 export。
 
-```powershell
-[System.Environment]::SetEnvironmentVariable(
-    'DEEPSEEK_API_KEY',
-    'sk-你的key在这里',
-    'User'
-)
+## 方式 A：云端 DeepSeek（推荐评测用）
+
+1. 到 https://platform.deepseek.com/api_keys 申请 key
+2. 编辑仓库根目录的 `.env`，把占位符换成真 key：
+
+```
+DEEPSEEK_API_KEY=sk-你的真key
 ```
 
-## 验证
+3. 验证：
 
-新开一个 PowerShell 窗口：
 ```powershell
-python -c "import os; print(bool(os.environ.get('DEEPSEEK_API_KEY')))"
+python -c "from src.llm_client import make_client, describe_llm_config; c=make_client(); print('enabled:', c.enabled); print(describe_llm_config())"
 ```
-应该输出 `True`。
+
+应输出 `enabled: True` 和 `hosted | base_url=... | api_key=yes`。
+
+## 方式 B：本地自托管 vLLM（不需要真 key）
+
+在 `.env` 里：
+
+```
+STENRAG_LLM_BASE_URL=http://127.0.0.1:8013/v1
+STENRAG_LLM_MODEL=llama-3.1-8b
+```
+
+设了 `STENRAG_LLM_BASE_URL` 就会**优先**指向本地服务器，走占位 key
+（vLLM 默认忽略 bearer token）。权重查找与自动启动见
+`src/local_llm_server.py`。
+
+## 单次运行临时覆盖
+
+优先级是 **显式参数 > 真实环境变量 > `.env`**，所以环境变量不会被
+`.env` 覆盖：
+
+```powershell
+$env:DEEPSEEK_API_KEY = "sk-临时key"; python eval/quick20_eval.py --use-llm
+Remove-Item Env:\DEEPSEEK_API_KEY
+```
 
 ## 安全注意
 
-- 写到 User 级（不是 System 级）——只影响你的账户
-- 这个 key **绝对不要 commit 到 git**。如果担心泄漏，我可以在跑完后帮你用 [System.Environment]::SetEnvironmentVariable 把 key 删掉
-- key 已经被你贴在聊天记录里——建议你跑完后去 DeepSeek 控制台 rotate 一次（生成新 key，禁用旧 key）
-
-## 跑 quick20_eval 启用 LLM
-
-```powershell
-cd C:\Users\zsf\Desktop\lyh\StenRAG
-python eval\quick20_eval.py --seed 7 --tag tfidfA_llm_s7 --use_llm
-```
-
-## 跑完后清 key
-
-```powershell
-[System.Environment]::SetEnvironmentVariable('DEEPSEEK_API_KEY', $null, 'User')
-```
+- `.env` 已在 `.gitignore` 里，**绝对不要 commit**。
+- key 如果贴进了聊天记录，跑完建议去 DeepSeek 控制台 rotate 一次。
+- 启动日志里会打印脱敏摘要（端点 / 模型 / 有无 key），**不会**打印 key
+  本身。

@@ -99,6 +99,7 @@ class GraphBuilder:
         spacy_model: str = "en_core_web_lg",
         enable_llm_summaries: bool = False,
         shared_nlp: object = None,
+        attribute_schema=None,
     ):
         """
         Initialize the graph builder.
@@ -108,12 +109,27 @@ class GraphBuilder:
             enable_llm_summaries: If True, generate LLM summaries for containers.
             shared_nlp: Pre-loaded spaCy model to share across instances
                 (recommended for batch evaluation).
+            attribute_schema: Optional `AttributeSchema` — the delta
+                produced by the attribute agent.  When given, it is
+                applied to the module tables BEFORE any container is
+                created, so the new attributes and classes are part of
+                every template this builder hands out.
         """
         if shared_nlp is not None:
             self.nlp = shared_nlp
         else:
             self.nlp = _load_spacy_shared(spacy_model)
-        
+
+        # Apply the agent's attribute delta first: the container manager
+        # builds its attribute slots from the templates, so the delta has
+        # to be in place before the first container exists.
+        self.attribute_schema = attribute_schema
+        if attribute_schema is not None:
+            try:
+                attribute_schema.apply_to_modules()
+            except Exception as e:  # noqa: BLE001
+                print(f"[graph_builder] attribute schema apply failed: {e}")
+
         # Core components
         self.sentence_registry = SentenceRegistry()
         self.edge_registry = EdgeRegistry()
@@ -122,10 +138,10 @@ class GraphBuilder:
             use_llm_summaries=enable_llm_summaries
         )
         self.entity_resolver = EntityResolver(nlp=self.nlp)
-        
+
         # Track sentences per container for intra-container edge building
         self._container_sentence_order: Dict[str, List[str]] = {}
-        
+
         # Configuration
         self._max_intra_container_comparisons = 3  # Compare with last N sentences
     
@@ -833,6 +849,14 @@ class GraphBuilder:
                             entity=ent,
                             attribute_name=aname,
                             weight=float(weight),
+                            # The OWNING entity's class is stored on the
+                            # mount, so a consumer can tell
+                            # `birth (Marie Curie, PERSON)` from
+                            # `date (Expo A, EVENT)` without re-running
+                            # NER.  The container's own class is only
+                            # the first non-empty type seen for that
+                            # entity, so it is NOT a reliable proxy.
+                            entity_type=etype or "",
                         )
                     )
             if not new_mounts:

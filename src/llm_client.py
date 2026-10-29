@@ -20,17 +20,21 @@ returns an empty string so the calling code can fall back to the template.
 
 API key handling (security):
   - Reads from environment variable DEEPSEEK_API_KEY (or OPENAI_API_KEY).
-  - NEVER hard-code keys. If the env var is missing, the client is
+  - The repository-root `.env` file is loaded AUTOMATICALLY (via
+    `python-dotenv`, when installed) — the eval scripts call
+    `make_client()` without any setup step, so the key has to be
+    reachable from there.
+  - NEVER hard-code keys. If no key can be resolved, the client is
     instantiated in disabled mode and the summarizer returns "".
   - If a literal key is provided to `DeepSeekClient(api_key=...)` for
     ad-hoc testing, it is logged in-memory only (never printed or
     persisted to disk).
 
 Usage:
-    >>> from src.llm_client import make_summarizer
-    >>> summarize = make_summarizer()  # auto-detects DEEPSEEK_API_KEY
-    >>> out = summarize("Dr. Sarah Chen", "She published a paper on...")
-    >>> print(out)
+    >>> from src.llm_client import make_client
+    >>> client = make_client()  # auto-detects .env / DEEPSEEK_API_KEY
+    >>> client.enabled
+    True
 """
 
 from __future__ import annotations
@@ -38,6 +42,7 @@ from __future__ import annotations
 import os
 import logging
 import time
+from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 try:
@@ -46,6 +51,118 @@ except ImportError:  # pragma: no cover - fallback path
     requests = None  # type: ignore
 
 logger = logging.getLogger(__name__)
+
+# ── .env auto-loading ──────────────────────────────────────────────────────
+#
+# The evaluation scripts (`eval/quick20_eval.py`, `eval/attribute_agent_eval.py`)
+# call `make_client()` with no arguments and no prior setup.  Before this,
+# the key had to be exported into the process environment by hand (or via
+# `load_dotenv()` pasted from the README), which silently disabled the
+# whole LLM path — `make_client()` returned a disabled client and every
+# LLM-dependent feature silently degraded.
+#
+# So: the repository-root `.env` is loaded here, once, at first use.
+# Real environment variables ALWAYS win over `.env` (python-dotenv's
+# default `override=False` behaviour), so an explicitly exported key is
+# never clobbered.
+#
+# `python-dotenv` is an OPTIONAL dependency — if it is missing we fall
+# back to a tiny built-in parser so the feature still works on a bare
+# install (the project rule forbids new heavy dependencies, and this is
+# a ~30-line fallback rather than a hard requirement).
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_DOTENV_LOADED = False
+
+
+def _parse_dotenv(text: str) -> Dict[str, str]:
+    """
+    Minimal `.env` parser — the subset of the format we actually need.
+
+    Supported:
+      * `KEY=value`
+      * `KEY = value` (spaces around `=` are ignored)
+      * `export KEY=value`
+      * `# comment` lines and blank lines
+      * single- or double-quoted values; quotes are stripped
+
+    NOT supported (and not needed here): variable interpolation
+    (`${OTHER_VAR}`), multi-line values, escaped quotes.
+    """
+    out: Dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not key:
+            continue
+        value = value.strip()
+        # Strip a trailing inline comment only for unquoted values.
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        else:
+            hash_pos = value.find(" #")
+            if hash_pos != -1:
+                value = value[:hash_pos].strip()
+        out[key] = value
+    return out
+
+
+def load_env_file(path: Optional[Path] = None) -> Dict[str, str]:
+    """
+    Load a `.env` file into `os.environ` (without overriding existing
+    values) and return the parsed mapping.
+
+    Tries `python-dotenv` first; if it is not installed, the built-in
+    parser above is used.  A missing file is not an error — it returns
+    an empty mapping.
+    """
+    env_path = Path(path) if path is not None else (_REPO_ROOT / ".env")
+    if not env_path.exists():
+        return {}
+
+    parsed: Dict[str, str] = {}
+    try:
+        from dotenv import dotenv_values  # type: ignore
+        parsed = {
+            k: v for k, v in dotenv_values(env_path).items() if v is not None
+        }
+    except ImportError:
+        try:
+            parsed = _parse_dotenv(env_path.read_text(encoding="utf-8"))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Failed to parse %s: %s", env_path, e)
+            return {}
+
+    applied = 0
+    for key, value in parsed.items():
+        # Real environment variables always win over the .env file.
+        if key not in os.environ:
+            os.environ[key] = value
+            applied += 1
+    logger.debug(
+        "Loaded %s (%d key(s), %d newly applied to os.environ)",
+        env_path, len(parsed), applied,
+    )
+    return parsed
+
+
+def _ensure_env_loaded() -> None:
+    """Load the repo-root `.env` exactly once per process."""
+    global _DOTENV_LOADED
+    if _DOTENV_LOADED:
+        return
+    _DOTENV_LOADED = True
+    try:
+        load_env_file()
+    except Exception as e:  # noqa: BLE001 - never break on a bad .env
+        logger.warning(".env loading failed (ignored): %s", e)
 
 
 # Default model: DeepSeek-V3 chat model (recommended for cost/perf).
@@ -111,7 +228,11 @@ class DeepSeekClient:
                 "Install it via `pip install requests`."
             )
 
-        # Resolve API key: explicit > env var
+        # Resolve API key: explicit > env var > .env file.
+        # `_ensure_env_loaded()` populates `os.environ` from the
+        # repo-root `.env` without overriding anything already set, so
+        # an explicitly exported key still wins.
+        _ensure_env_loaded()
         if api_key is None:
             api_key = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get(
                 "OPENAI_API_KEY"
@@ -321,7 +442,12 @@ def make_client(
     local server the bearer token is a placeholder (vLLM ignores it
     unless --api-key was passed), while for the hosted API a real key
     is still required.
+
+    The repo-root `.env` is loaded automatically, so a key written
+    there is picked up with no further setup.
     """
+    _ensure_env_loaded()
+
     local_base = (os.environ.get(LOCAL_LLM_BASE_URL_ENV) or "").strip()
     local_model = (os.environ.get(LOCAL_LLM_MODEL_ENV) or "").strip()
 
@@ -353,4 +479,69 @@ def make_client(
         model=model or DEFAULT_DEEPSEEK_MODEL,
         timeout=timeout,
         max_retries=max_retries,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Introspection helpers
+# ---------------------------------------------------------------------------
+
+def local_llm_configured() -> bool:
+    """
+    True when a local (self-hosted) OpenAI-compatible server is targeted.
+
+    That is the case when `STENRAG_LLM_BASE_URL` is set.  A local server
+    does not need a real API key — vLLM ignores the bearer token unless
+    `--api-key` was passed — so this is deliberately independent of
+    whether a key exists.
+    """
+    _ensure_env_loaded()
+    return bool((os.environ.get(LOCAL_LLM_BASE_URL_ENV) or "").strip())
+
+
+def llm_available() -> bool:
+    """
+    True when a chat call can actually be made.
+
+    Either a hosted key is present (`DEEPSEEK_API_KEY` / `OPENAI_API_KEY`),
+    or a local server is configured (`STENRAG_LLM_BASE_URL`).
+
+    This is the cheap "is the LLM path live?" check the evaluation
+    scripts log at startup — it avoids the confusing situation where
+    `make_client()` returns a disabled client and every LLM-dependent
+    feature silently degrades to a fallback.
+    """
+    _ensure_env_loaded()
+    if local_llm_configured():
+        return True
+    return bool(
+        os.environ.get("DEEPSEEK_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+    )
+
+
+def describe_llm_config() -> str:
+    """
+    A one-line, secret-free description of the LLM configuration.
+
+    Safe to log: it reports WHICH endpoint/model will be used and
+    whether a key is present, but never the key itself.
+    """
+    _ensure_env_loaded()
+    if local_llm_configured():
+        base = (os.environ.get(LOCAL_LLM_BASE_URL_ENV) or "").strip()
+        model = (os.environ.get(LOCAL_LLM_MODEL_ENV) or "").strip() \
+            or DEFAULT_DEEPSEEK_MODEL
+        has_key = bool(os.environ.get(LOCAL_LLM_API_KEY_ENV))
+        return (
+            f"local server | base_url={base} | model={model} | "
+            f"api_key={'yes' if has_key else 'placeholder'}"
+        )
+    model = DEFAULT_DEEPSEEK_MODEL
+    has_key = bool(
+        os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    )
+    return (
+        f"hosted | base_url={DEFAULT_DEEPSEEK_BASE_URL} | model={model} | "
+        f"api_key={'yes' if has_key else 'NO'}"
     )

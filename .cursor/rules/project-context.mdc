@@ -1,0 +1,67 @@
+---
+description: StenRAG 项目总览：技术栈、模块职责、目录结构、数据流，以及"设计决策必须同步文档"的硬性要求
+alwaysApply: true
+---
+
+# StenRAG 项目上下文
+
+基于属性的agent记忆组织检索系统（LocoMO等长规划/多跳 QA 评测向）。**基于属性的agent系统，实现三层图结构，实现短期记忆长期记忆上下文记忆联动**。
+
+当前主题
+
+现在在上下文记忆设计环节，目标设计agent滚动优化属性表的属性sentence_graph.py (113-174) 这个类可能缺失，类里面的属性也可能缺失我想要实现的是。随机抽取20题10次让agent判断是否缺少对应属性，实体缺少对应的类，如果缺少则补充，补充的要求是该属性必须具有包容性如果这个属性后面挂载句子效率低就丢弃这个属性或者类。属性挂载句子以后要有区分度是谁的属性如 birth（A）， date（EVENT_A)类似于这种，如果句子包含多实体且在同一个大类则调用llm判断兜底。
+
+## 技术栈
+
+Python 3 / spaCy `en_core_web_lg` / numpy / faiss-cpu / scikit-learn / sentence-transformers / requests。
+LLM 侧兼容任何 OpenAI Chat Completions 协议的端点：DeepSeek、OpenAI、Azure、vLLM、Ollama。
+
+## 模块职责
+
+| 模块 | 职责 |
+|---|---|
+| `src/sentence_graph.py` | 全局句子节点仓库：`SentenceNode`、`LogicEdge`、`SentenceRegistry`、`EdgeRegistry`、`AttributeRegistry` |
+| `src/graph_builder.py` | 逻辑边构建 + Core/Satellite 角色分类（8 条规则，优先级固定） |
+| `src/container_manager.py` | 容器聚合、容器分裂、TF-IDF 关键词与模板摘要 |
+| `src/entity_resolver.py` | 实体归一化，最长表面形式胜出（D20） |
+| `src/fuzzy_match.py` | 实体 → 容器的模糊匹配（HotpotQA 问法变体） |
+| `src/stengraph_pipeline.py` | 端到端检索流水线（分步 + 打分） |
+| `src/dispatcher.py` | 顶层薄封装，转调 `StenGraphPipeline` |
+| `src/query_analyzer.py` | LLM 查询路由：抽取语义实体、问题类型等（单次 LLM 调用） |
+| `src/llm_entity_extractor.py` | LLM 具名实体抽取（多跳 QA 用的"命名锚点"版本） |
+| `src/answer_extractor.py` | **最终答案抽取的唯一真相源**，prompt 只写在这里 |
+| `src/hyper_edge.py` | 超图 / 并查集支持的多跳扩展 |
+| `src/llm_client.py` | OpenAI 兼容 LLM 客户端，`make_summarizer()` / `make_client()` |
+| `src/local_llm_server.py` | 本地 vLLM 服务的启动与权重准备 |
+| `src/model_paths.py` | HF 模型名 → 本地磁盘路径解析（离线加载） |
+
+> 注意：`src/retriever.py` **已不存在**（在死代码清理中被删除）。`README.md` 与 `docs/DESIGN.md` 中对 `retriever.py` / `Retriever` 的引用已过时，改动相关代码时顺手修正文档。
+
+## 数据流
+
+```
+句子 → entity_resolver → graph_builder（建边 + 定角色）→ container_manager（聚合/分裂）
+     → sentence_graph（节点与边入库）
+查询 → query_analyzer / llm_entity_extractor → stengraph_pipeline（粗召回→打分→重排）
+     → answer_extractor（最终答案）
+```
+
+## 硬性要求：设计决策必须同步文档
+
+`docs/DESIGN.md` 是这个仓库**唯一的设计真相源**，明确规定：
+
+> "This document is maintained alongside the code. When a design decision changes, this document must be updated in the same commit."
+
+`docs/改造日志.md` 记录每次改造的目的、改动点、以及**跑前跑后指标**。
+
+因此：
+
+- 改动阈值、公式、规则优先级、默认值 → 必须更新 `docs/DESIGN.md`（含决策编号 D1–D22 与决策表）
+- 改动检索/分类/打分行为 → 必须更新 `docs/改造日志.md`，并记录指标变化
+- 涉及 `src/retriever.py` 的内容已过时，改动时要迁到 `stengraph_pipeline.py` / `graph_builder.py` 等现存模块
+
+## 行动约定
+
+- 模块顶部写模块级 docstring，说明"为什么存在"（不只是"是什么"），并注明相关设计决策编号，代码改动增加模块也必须写注释要求包含改动时间，目的，功能，结尾注释结束
+- 没有我的命令不要自己运行终端。自己改动代码。每次行动之前都要认真思考可行性，为什么要执行下一步计划预计收益是什么，是否偏离主题。
+- 不要引入新的重型依赖（如 RST parser、新的 embedding 模型，ce排序），除非任务明确要求

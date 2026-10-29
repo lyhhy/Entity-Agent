@@ -362,6 +362,14 @@ A quick-reference table of every non-trivial design decision in the codebase:
 | D20 | Entity | Longest surface form → canonical | `entity_resolver.py` | Longest-first |
 | D21 | Keywords | Top 3 TF-IDF keywords per container | `container_manager.py` | 3 |
 | D22 | Confidence | `role_confidence = weighted_sum / total_weight` | `graph_builder.py` | N/A |
+| D23 | Attribute | 属性表为运行期 schema 增量，agent 不改源码 | `attribute_schema.py` | Delta over static tables |
+| D24 | Attribute | 缺口在**问句**侧检测（独立于句级词干表） | `attribute_agent.py` | `QUESTION_TRIGGERS` |
+| D25 | Attribute | 候选属性/类词表**有界**，agent 不得凭空发明 | `attribute_schema.py` | Candidate lexicons |
+| D26 | Attribute | 三准则把关：包容性 / 挂载效率 / 区分度 | `attribute_agent.py` | See §15 |
+| D27 | Attribute | 度量必须复刻真实挂载（模板受限 + 先加权后排序） | `attribute_agent.py` | Mirrors `soft_mount` |
+| D28 | Attribute | LLM 仅两处兜底：同大类多实体归属 + 缺口确认 | `attribute_agent.py` | Optional |
+| D29 | Attribute | agent 增量必须被指标验证：一条命令「优化→应用→测量」，A/B 模式下先测 baseline 再应用增量 | `quick20_eval.py` | See §16 |
+| D30 | LLM | `.env` 在 `make_client()` 内自动加载；优先级 显式参数 > 环境变量 > `.env`；启动时打印脱敏配置 | `llm_client.py` | See §17 |
 
 ---
 
@@ -471,6 +479,271 @@ except Exception:
 | Large graph (100+ containers), high-stakes QA | **LLM** (richer semantic matching) |
 | Real-time retrieval, low latency | **Template** (LLM adds 200-500ms per container at build) |
 | Multi-language or specialized domain (e.g., biology) | **LLM** (better than TF-IDF for non-English stopword filtering) |
+
+---
+
+## 15. Attribute Table Rolling Optimisation Agent (D23–D28)
+
+**File:** `src/attribute_agent.py`, `src/attribute_schema.py`
+**Pattern Source:** `AttributeAgent.run()`, `AttributeAgent._gate()`, `AttributeAgent._measure()`
+
+### Context: The Context-Memory Design Stage
+
+The attribute table decides, for every sentence, WHICH property it
+carries ("birth", "date", "genre", ...) and FOR WHICH entity.  A missing
+attribute means the memory cannot answer a question about that property;
+a missing entity class means every sentence about that kind of entity
+falls back to the `description` catch-all and carries no usable signal.
+
+The table was hard-coded in `sentence_graph.py` as module-level
+constants.  The design stage requires an agent that ROLLS it: sample
+questions, notice what is missing, patch the table, and re-measure.
+
+### Decision: The Table Is a Runtime Delta, Not Source Code
+
+`AttributeSchema` holds the agent's changes as a DELTA and applies them
+to three places that must agree:
+
+1. the module-level tables in `sentence_graph` (so registries created
+   later inherit the change);
+2. an already-built `AttributeRegistry` (so containers that exist right
+   now see the change);
+3. the container attribute slots (so a new attribute can be mounted
+   immediately).
+
+**Why not rewrite the source file?**  The constants are interleaved with
+the legacy regex tables, `ATTRIBUTE_NAMES` must stay in sync with
+`ATTRIBUTE_DESCRIPTORS` (both define the attribute embedding matrix
+layout), and an agent that rewrites source files on every iteration is
+unreviewable.  The delta is persisted as JSON; `export_python()` emits a
+pasteable snippet, and a human decides whether to make it permanent.
+
+**Critical implementation note:** the module tables are mutated **IN
+PLACE**.  `graph_builder` and `stengraph_pipeline` import
+`ATTRIBUTE_NAMES` and `ATTRIBUTE_DESCRIPTORS` by name at import time;
+rebinding the module attribute would leave them pointing at the old
+list while the agent believed it had applied the change.
+
+### Decision: Gaps Are Detected On The Question Side
+
+The tables in `sentence_graph` carry SENTENCE-level stems ("born",
+"died").  Gap detection works on the QUESTION side: "When was X born"
+asks for `birth` even though the question never contains "born" on its
+own.  `QUESTION_TRIGGERS` is therefore a separate table, keyed by
+attribute, holding the phrasings a question uses.
+
+### Decision: The Candidate Lexicons Are Bounded
+
+The agent may only propose attributes and classes that appear in
+`ATTRIBUTE_CANDIDATE_LEXICON` / `CLASS_CANDIDATE_LEXICON`.  An
+unbounded vocabulary would let the agent invent an attribute per
+sentence — the exact failure the "inclusivity" criterion exists to
+prevent.  Every proposal is still subject to the three gates.
+
+### Decision: Three Gates, And What Each One Buys
+
+| Gate | Rule | What it prevents |
+|---|---|---|
+| **Inclusivity** | ≥2 triggers or stems; descriptor not a near-duplicate of an existing attribute (cos ≥ 0.80) | One-off details; duplicate attributes that add a slot but no recall |
+| **Mount efficiency** | `mount_count ≥ min_mount_count` AND `global_rate ≥ min_global_mount_rate` | Attributes that occupy a slot in the embedding matrix and in every entity template while answering almost nothing |
+| **Distinctiveness** | The attribute's top-K hit rate for its own class must exceed the best rate among the other classes that could plausibly own it, by `min_distinctiveness_margin` | Attributes that rank equally for several classes and therefore discriminate nothing |
+
+**Why the margin is measured against "classes that could plausibly own
+it"** (the lexicon's `types` list) rather than against every class:
+most classes never mount a `religion` slot at all, so they contribute a
+rate of 0.0 and would inflate the margin into meaninglessness.
+
+**Why a duplicate is rejected rather than merged:** a duplicate
+descriptor means the existing attribute already covers those sentences;
+adding it buys no recall and costs a slot in the matrix that every
+entity template pays for.
+
+### Decision: The Owner Class Is Measured, Not Assumed
+
+The gap is DETECTED on the class the question anchors on, but the
+attribute is not necessarily OWNED by that class.  `religion` fits
+PERSON and NORP equally well; the sentences that carry the fact may
+belong to either.
+
+The measurement therefore decides the owner: among the classes the
+candidate lexicon allows (`ATTRIBUTE_CANDIDATE_LEXICON[...]["types"]`),
+the one on which the attribute wins the most top-K slots becomes its
+owner, and the attribute is declared by THAT class.  This is what makes
+the "属性挂载句子以后要有区分度是谁的属性" requirement hold at the
+class level rather than merely at the sentence level.
+
+**Tie-break:** when two allowed classes win the SAME number of slots,
+the class the question anchored on wins.  Without this the tie would be
+broken alphabetically, which is arbitrary and would put `religion` on
+NORP for a question about a person — even though the question's own
+anchor says PERSON.  The anchor is a *preference*, not a guarantee: if
+the other class genuinely wins more slots, it takes ownership.
+
+### Decision: The Measurement Mirrors The Real Mount
+
+This is the single most important implementation constraint.  A
+candidate that would never win a mount slot in production must not be
+accepted, so `_measure()` reproduces `AttributeRegistry.soft_mount()`:
+
+* the ranking set for a sentence of class X is **X's own template**
+  (the one it WOULD have, including the candidate) — the real mount
+  restricts itself to the attributes the entity declares, so a PERSON
+  never mounts `population`;
+* the per-attribute weight is applied **BEFORE** the ranking, so the
+  `description` catch-all (weight 0.7) cannot occupy a top-K slot;
+* only the top `ATTR_MOUNT_TOP_K` attributes count as mounted.
+
+**Why this matters:** judging a candidate by the raw cosine between
+the sentence and the descriptor systematically over-estimates it.  The
+raw cosine ignores both the template restriction and the catch-all
+down-weight, and both change top-K membership.  An earlier version of
+the agent used the raw cosine and accepted candidates that the real
+mount would never have mounted.
+
+### Decision: The LLM Is A Fallback In Exactly Two Places
+
+Both are optional (`use_llm=False` disables them) and both are bounded
+by `max_llm_calls`:
+
+1. **Same-class multi-entity ownership.**  A sentence carrying two
+   entities of the SAME class ("Washington and Lincoln") mounts under
+   the same attribute for both, because the vector profile carries no
+   entity signal.  The LLM decides which entity the attribute belongs
+   to.  This is the case the design calls "如果句子包含多实体且在同
+   一个大类则调用 llm 判断兜底".
+2. **Gap confirmation.**  The deterministic detector fires on question
+   trigger vocabulary, which can produce false positives ("when was"
+   matches the `founded` trigger for an ORG too).  The LLM confirms
+   before the gap is accepted, so the table does not accumulate junk.
+
+Everything else — sampling, gap detection, measurement, gating — is
+deterministic.  Sampling derives a per-round seed from `config.seed`,
+so a run is reproducible but each round sees different questions.
+
+### Decision: Sentence IDs Are Namespaced Per Question
+
+Sentence IDs restart at `s_0001` in every graph.  Accumulating profiles
+across 200 draws without namespacing would count one graph's statistics
+200 times, and every corpus-level statistic (mount rate, class hit rate)
+would be wrong.  Profiles are keyed `"{qid}::{sid}"`.
+
+### Decision: The Agent Applies The Delta And Re-Mounts
+
+After accepting a gap, the agent applies the delta to the module tables
+and re-mounts the last graph's sentences, so the new attributes take
+effect immediately rather than only on the next build.  `GraphBuilder`
+also accepts an `attribute_schema` argument and applies it **before the
+first container is created**, so a persisted delta is part of every
+template the builder hands out.
+
+---
+
+## 16. The Agent Is Measured, Not Assumed (D29)
+**File:** `eval/attribute_agent_eval.py`, `eval/quick20_eval.py`
+**Pattern Source:** `run_attribute_agent()`, `_evaluate_sample()`
+
+### Context
+
+D23–D28 define HOW the agent decides.  They do not answer the question
+that actually matters: **does adding an attribute help or hurt
+retrieval?**  Before this section, the agent produced a JSON delta and
+the evaluation harness produced EM/F1, and the two were never connected.
+A delta could be accepted by all three gates and still make retrieval
+worse — e.g. by adding a slot that occupies the top-K of every sentence
+and displaces the attribute the question actually asked for.
+
+### Decision: One Command Runs Optimise → Apply → Measure
+
+`eval/quick20_eval.py` gained the `--attr-agent` flag.  It runs the agent
+on the sampled questions, applies the accepted delta to the module
+tables, and then evaluates — so the graphs that are measured are graphs
+built from the *new* attribute table.
+
+The reusable entry point is `run_attribute_agent()` in
+`eval/attribute_agent_eval.py` (the standalone CLI's `main()` is now a
+thin wrapper around it).  It accepts either raw HotpotQA records or
+already-loaded question dicts, and takes an optional pre-loaded spaCy
+pipeline so the evaluation harness does not load `en_core_web_lg` twice.
+
+### Decision: A/B Mode Runs The Evaluation Twice, In A Fixed Order
+
+`--attr-agent-ab` measures the delta directly:
+
+1. **baseline** — evaluate the sample with the CURRENT attribute table;
+2. **agent** — run the agent, apply the accepted delta;
+3. **treatment** — evaluate the same sample again;
+4. print the per-metric delta and write `<out>_ab.json`.
+
+**The order is a hard constraint.**  Containers draw their attribute
+slots from the module-level templates in `sentence_graph`, so the
+"currently effective attribute table" is the only thing that differs
+between the two runs.  Running the agent first would make both sides
+use the new table and the delta would be identically zero.
+
+The evaluation loop was extracted into `_evaluate_sample()` for this —
+returning `(summary, records)` instead of writing files — so both sides
+of the comparison share exactly the same code path and the same sample.
+
+### Decision: The Delta Stays A Delta
+
+The agent still does not rewrite source files.  The accepted delta is
+written to JSON (`--attr-agent-out`) with a pasteable Python snippet
+beside it; whether to make it permanent stays a human decision.  A/B
+mode exists to give that human the evidence.
+
+---
+
+## 17. LLM Configuration Is Auto-Loaded (D30)
+
+**File:** `src/llm_client.py`
+**Pattern Source:** `load_env_file()`, `make_client()`, `describe_llm_config()`
+
+### Context
+
+The evaluation scripts call `make_client()` with no arguments.  Before
+this section, `make_client()` read `os.environ` only — the repo-root
+`.env` was never loaded by any code path.  The README told the user to
+call `load_dotenv()` manually, but no script did it, so the observable
+result was that `make_client()` returned a **disabled** client and every
+LLM-dependent feature silently degraded to a heuristic fallback.
+
+That failure mode is invisible in the logs (the client is disabled
+rather than erroring) and it makes an A/B measurement meaningless: the
+"treatment" run would look identical to the "baseline" run because
+neither actually used an LLM.
+
+### Decision: `.env` Is Loaded Inside `make_client()`
+
+`_ensure_env_loaded()` reads the repo-root `.env` exactly once per
+process, on the first `make_client()` / `DeepSeekClient()` call.
+
+**Precedence: explicit argument > real environment variable > `.env`.**
+An already-exported environment variable is never overwritten by the
+file, so a single-run override still works:
+
+```powershell
+$env:DEEPSEEK_API_KEY = "sk-..."; python eval/quick20_eval.py
+```
+
+`python-dotenv` is used when installed; otherwise a ~30-line built-in
+parser (`_parse_dotenv`) handles the subset of the format that is
+actually needed (`KEY=value`, `export KEY=value`, quotes, comments).
+The fallback exists because the project rule forbids new heavy
+dependencies — but a *missing optional* package must not become a
+missing feature.
+
+### Decision: The Configuration Is Logged, Secret-Free
+
+`describe_llm_config()` returns a one-line summary of WHICH endpoint
+and model will be used and whether a key is present — never the key
+itself.  Both eval scripts log it at startup, so a run's log states
+whether the LLM path was live.  `llm_available()` and
+`local_llm_configured()` give the same signal programmatically.
+
+**Why this matters for the measurements:** a run whose LLM was silently
+disabled looks exactly like a run whose LLM had no effect.  Making the
+configuration explicit in the log is what allows the A/B numbers in
+§16 to be trusted.
 
 ---
 

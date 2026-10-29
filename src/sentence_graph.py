@@ -96,19 +96,48 @@ ATTR_MOUNT_MIN_SIM: float = 0.05
 @dataclass
 class AttributeMount:
     """
-    A (entity, attribute_name) mount entry for a single sentence.
+    A (entity, entity_type, attribute_name) mount entry for a single sentence.
 
     Used inside SentenceNode.attribute_mounts. Records that this
     sentence should appear in `container[entity].attributes[attribute_name]`.
 
     A sentence can have multiple mounts when it covers multiple
     entities × attributes.
+
+    `entity_type` is the spaCy NER class of the OWNING entity (PERSON,
+    ORG, GPE, ...).  It is stored on the mount rather than looked up
+    later because the container's class is only the FIRST non-empty
+    type seen for that entity — a sentence may mention an entity whose
+    class differs from the class its container settled on.  Keeping the
+    type next to the mount is what lets a consumer answer "which
+    attribute belongs to WHICH entity of WHICH kind" without re-running
+    NER, e.g. `birth (Marie Curie, PERSON)` vs `date (Expo A, EVENT)`.
     """
     entity: str
     attribute_name: str
     # The "weight" with which this mount was classified
     # (1.0 = strong pattern match, 0.5 = fallback "other" mount).
     weight: float = 1.0
+    # The NER class of `entity` ("" when unknown).
+    entity_type: str = ""
+
+    def label(self) -> str:
+        """Human-readable form: `attribute (Entity, TYPE)`."""
+        if self.entity_type:
+            return f"{self.attribute_name} ({self.entity}, {self.entity_type})"
+        return f"{self.attribute_name} ({self.entity})"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "entity": self.entity,
+            "attribute_name": self.attribute_name,
+            "weight": self.weight,
+            "entity_type": self.entity_type,
+        }
+
+    def __repr__(self) -> str:
+        return f"AttributeMount({self.label()}, w={self.weight:.2f})"
+
 
 _ATTRIBUTE_TEMPLATES = {
     "PERSON": {

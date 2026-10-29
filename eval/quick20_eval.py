@@ -370,6 +370,62 @@ def main() -> int:
             "warning.  Set to '' (empty) to disable."
         ),
     )
+    # ------------------------------------------------------------------
+    # Attribute-agent (rolling attribute-table optimisation)
+    # ------------------------------------------------------------------
+    ap.add_argument(
+        "--attr-agent", action="store_true",
+        help=(
+            "Run the attribute agent on the sampled questions BEFORE "
+            "the EM/F1 measurement, and let the accepted delta take "
+            "effect on the graphs that are then evaluated."
+        ),
+    )
+    ap.add_argument(
+        "--attr-agent-ab", action="store_true",
+        help=(
+            "A/B mode: evaluate the sample TWICE — once with the "
+            "current attribute table (baseline) and once after the "
+            "agent's delta has been applied — and log the delta of "
+            "every metric.  Implies --attr-agent."
+        ),
+    )
+    ap.add_argument(
+        "--attr-agent-n", type=int, default=20,
+        help="Questions drawn per agent round (default 20).",
+    )
+    ap.add_argument(
+        "--attr-agent-rounds", type=int, default=10,
+        help="Agent sampling rounds (default 10).",
+    )
+    ap.add_argument(
+        "--attr-agent-seed", type=int, default=1234,
+        help="Base seed of the agent's sampling (default 1234).",
+    )
+    ap.add_argument(
+        "--attr-agent-schema", default="",
+        help=(
+            "Path to an existing attribute-schema delta to roll forward "
+            "from (e.g. eval/results/attribute_schema.json)."
+        ),
+    )
+    ap.add_argument(
+        "--attr-agent-out", default="eval/results/attribute_schema.json",
+        help="Where to persist the accepted schema delta.",
+    )
+    ap.add_argument(
+        "--attr-agent-report", default="eval/results/attribute_agent_report.json",
+        help="Where to persist the agent's full run report.",
+    )
+    ap.add_argument(
+        "--attr-agent-no-llm", action="store_true",
+        help="Disable the agent's LLM fallbacks (gap confirmation / "
+             "ambiguous-owner arbitration).",
+    )
+    ap.add_argument(
+        "--attr-agent-dry-run", action="store_true",
+        help="Detect and report gaps but do NOT apply the delta.",
+    )
     args = ap.parse_args()
 
     log.info("Loading %s", args.data)
@@ -404,17 +460,20 @@ def main() -> int:
     # new LLM entity extractor (Phase-1 fix) is active even when the
     # user does not pass --use-llm. --use-llm additionally enables
     # LLM-based answer span extraction.
+    #
+    # `make_client()` auto-loads the repo-root `.env`, so a key written
+    # there is picked up with no extra setup step.
     client = None
     try:
-        from src.llm_client import make_client
+        from src.llm_client import make_client, describe_llm_config
         client = make_client()
         log.info("LLM client: %s", "yes" if client.enabled else "no (no key)")
+        log.info("LLM config: %s", describe_llm_config())
     except Exception as e:
         log.warning("LLM init failed: %s", e)
 
-    # Dispatcher + hyperedge registry factory.
-    from src.dispatcher import build_dispatcher
-    from src.hyper_edge import HyperEdgeRegistry
+    # Dispatcher + hyperedge registry are constructed per question inside
+    # `_evaluate_sample()`, so they are imported there.
 
     # ── Offline hyperedge store ───────────────────────────────────────
     # When --offline-hyperedges <parquet> is given, hyperedges are
@@ -424,8 +483,6 @@ def main() -> int:
     # (e.g. when running on a question that wasn't in the offline
     # corpus).
     offline_store = None
-    n_offline_para = 0
-    n_offline_para_missing = 0
     if args.offline_hyperedges:
         try:
             from src.offline_hyperedge_store import OfflineHyperEdgeStore
@@ -447,10 +504,229 @@ def main() -> int:
         log.error("--use-llm requested but no LLM key found. Aborting.")
         return 1
 
+    # ------------------------------------------------------------------
+    # Attribute agent (rolling attribute-table optimisation)
+    # ------------------------------------------------------------------
+    #
+    # The agent can run in three ways:
+    #   (none)    — the current attribute table is used as-is.
+    #   --attr-agent      — the agent runs FIRST, its delta is applied to
+    #                    the module tables, and the evaluation then runs
+    #                    on graphs that inherit the new attributes.
+    #   --attr-agent-ab   — the evaluation runs TWICE: once with the
+    #                    current table (baseline) and once after the
+    #                    delta has been applied (treatment).  The metric
+    #                    delta is logged at the end.
+    run_agent = bool(args.attr_agent or args.attr_agent_ab)
+    agent_report = None
+    agent_schema = None
+
+    # ------------------------------------------------------------------
+    # A/B BASELINE — must run BEFORE the agent patches the module tables.
+    # ------------------------------------------------------------------
+    baseline_summary = None
+    baseline_records: List[Dict[str, Any]] = []
+    if args.attr_agent_ab:
+        log.info("=" * 68)
+        log.info("A/B BASELINE — current attribute table")
+        log.info("=" * 68)
+        from src.progress import ConsoleReporter
+        base_progress = ConsoleReporter(prefix="baseline")
+        baseline_summary, baseline_records = _evaluate_sample(
+            args, sample, nlp, client, offline_store,
+            progress=base_progress, label="baseline",
+        )
+        base_progress.finish()
+
+    if run_agent:
+        # `eval/` is not a package (no __init__.py), so the helper module
+        # is imported by path rather than as `eval.attribute_agent_eval`.
+        import importlib.util
+        _agent_eval_path = Path(__file__).resolve().parent / "attribute_agent_eval.py"
+        _spec = importlib.util.spec_from_file_location(
+            "attribute_agent_eval", _agent_eval_path,
+        )
+        _agent_eval = importlib.util.module_from_spec(_spec)
+        sys.modules["attribute_agent_eval"] = _agent_eval
+        _spec.loader.exec_module(_agent_eval)
+        run_attribute_agent = _agent_eval.run_attribute_agent
+        log_report = _agent_eval.log_report
+
+        from src.attribute_schema import AttributeSchema
+        from src.progress import ConsoleReporter
+
+        # Progress reporter — the agent samples 200 questions by
+        # default, so the run needs a live "how far are we" line.
+        agent_progress = ConsoleReporter(prefix="agent")
+
+        # Roll forward from an existing delta, if one was given.
+        if args.attr_agent_schema:
+            agent_schema = AttributeSchema.load(args.attr_agent_schema)
+            log.info(
+                "Loaded attribute-schema delta: %d attribute(s), %d class(es) "
+                "from %s",
+                len(agent_schema.attributes), len(agent_schema.classes),
+                args.attr_agent_schema,
+            )
+            agent_schema.apply_to_modules()
+
+        agent_report = run_attribute_agent(
+            sample,
+            n_questions=args.attr_agent_n,
+            n_rounds=args.attr_agent_rounds,
+            seed=args.attr_agent_seed,
+            use_llm=not args.attr_agent_no_llm,
+            apply=not args.attr_agent_dry_run,
+            client=client,
+            schema=agent_schema,
+            nlp=nlp,
+            progress=agent_progress,
+            report_path=args.attr_agent_report,
+            schema_path=args.attr_agent_out,
+        )
+        log_report(agent_report)
+
+    # ------------------------------------------------------------------
+    # Evaluation
+    # ------------------------------------------------------------------
     if args.mode == "hyperedge_compare":
         return _main_hyperedge_compare(
             args, all_data, indices, nlp, client,
         )
+
+    if args.attr_agent_ab:
+        log.info("=" * 68)
+        log.info("A/B TREATMENT — attribute table + agent delta")
+        log.info("=" * 68)
+
+    from src.progress import ConsoleReporter
+    eval_progress = ConsoleReporter(
+        prefix="treatment" if args.attr_agent_ab else "eval",
+    )
+    summary, records = _evaluate_sample(
+        args, sample, nlp, client, offline_store,
+        progress=eval_progress,
+    )
+    eval_progress.finish({
+        "EM": f"{summary.get('em', 0.0):.3f}",
+        "F1": f"{summary.get('f1', 0.0):.3f}",
+        "R5": f"{summary.get('r5', 0.0):.3f}",
+    })
+
+    # ------------------------------------------------------------------
+    # A/B delta
+    # ------------------------------------------------------------------
+    if baseline_summary is not None:
+        _log_ab_delta(baseline_summary, summary)
+        # Persist both sides next to the main result file.
+        out_path = Path(args.out)
+        ab_path = out_path.with_name(out_path.stem + "_ab.json")
+        with open(ab_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "baseline": baseline_summary,
+                    "treatment": summary,
+                    "delta": {
+                        k: summary[k] - baseline_summary[k]
+                        for k in ("em", "f1", "r1", "r5", "r10")
+                    },
+                    "agent": {
+                        "n_gaps": len(agent_report.gaps) if agent_report else 0,
+                        "n_accepted": (
+                            len(agent_report.accepted) if agent_report else 0
+                        ),
+                        "n_rejected": (
+                            len(agent_report.rejected) if agent_report else 0
+                        ),
+                        "llm_calls": (
+                            agent_report.llm_calls if agent_report else 0
+                        ),
+                        "accepted_attributes": sorted(
+                            g.attribute
+                            for g in (agent_report.accepted if agent_report else [])
+                            if g.attribute
+                        ),
+                        "accepted_classes": sorted(
+                            g.entity_type
+                            for g in (agent_report.accepted if agent_report else [])
+                            if g.kind == "missing_class"
+                        ),
+                    },
+                },
+                f, ensure_ascii=False, indent=2,
+            )
+        log.info("A/B detail → %s", ab_path)
+
+    # ------------------------------------------------------------------
+    # Persist the treatment run.
+    # ------------------------------------------------------------------
+    out_path = Path(args.out)
+    out_path.parent.mkdir(exist_ok=True, parents=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                **summary,
+                "records": records,
+                "attr_agent": {
+                    "ran": run_agent,
+                    "ab": bool(args.attr_agent_ab),
+                    "n_gaps": len(agent_report.gaps) if agent_report else 0,
+                    "n_accepted": (
+                        len(agent_report.accepted) if agent_report else 0
+                    ),
+                    "n_rejected": (
+                        len(agent_report.rejected) if agent_report else 0
+                    ),
+                    "accepted_attributes": sorted(
+                        g.attribute
+                        for g in (agent_report.accepted if agent_report else [])
+                        if g.attribute
+                    ),
+                    "accepted_classes": sorted(
+                        g.entity_type
+                        for g in (agent_report.accepted if agent_report else [])
+                        if g.kind == "missing_class"
+                    ),
+                },
+            },
+            f, ensure_ascii=False, indent=2,
+        )
+    log.info("Results → %s", out_path)
+
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────────
+# The evaluation loop (extracted so A/B mode can run it twice)
+# ─────────────────────────────────────────────────────────────────────
+def _evaluate_sample(
+    args,
+    sample: List[Dict[str, Any]],
+    nlp,
+    client,
+    offline_store,
+    progress=None,
+    label: str = "eval",
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """
+    Run the EM/F1 evaluation over `sample` and return (summary, records).
+
+    The attribute table that is live in `src.sentence_graph` at the time
+    this is called determines the attribute slots every container gets —
+    so calling this twice (before and after the agent's delta) yields a
+    clean A/B comparison.
+
+    Args:
+        progress: Optional progress reporter (see `src/progress.py`).
+            When given, a live line shows how many questions are done
+            and the running EM/F1/R@k tally.
+        label:    The phase name shown on the progress line.
+    """
+    from src.dispatcher import build_dispatcher
+    from src.hyper_edge import HyperEdgeRegistry
+
+    n_offline_para = 0
+    n_offline_para_missing = 0
 
     ems: List[bool] = []
     f1s: List[float] = []
@@ -873,7 +1149,27 @@ def main() -> int:
             },
         })
 
+        # Live progress: how far through the sample we are, plus the
+        # running metric tally.  Without this the user sees nothing
+        # between the start banner and the final summary.
+        if progress is not None:
+            n_done = len(ems)
+            progress.update(
+                n_done, len(sample),
+                f"EM={sum(ems) / max(1, n_done):.3f} "
+                f"R@5={sum(r5s) / max(1, n_done):.3f}",
+            )
+            progress.set_extra(
+                EM=f"{sum(ems) / max(1, n_done):.3f}",
+                F1=f"{sum(f1s) / max(1, n_done):.3f}",
+                R5=f"{sum(r5s) / max(1, n_done):.3f}",
+            )
+
     # Summary.
+    if not ems:
+        log.warning("No questions were evaluated (sample is empty).")
+        return {"n": 0, "em": 0.0, "f1": 0.0, "r1": 0.0, "r5": 0.0,
+                "r10": 0.0, "paths": {}, "hybrid": {}}, records
     em_avg = sum(ems) / len(ems)
     f1_avg = sum(f1s) / len(f1s)
     r1_avg = sum(r1s) / max(1, len(r1s))
@@ -889,27 +1185,40 @@ def main() -> int:
              args.bm25_weight if 0 <= args.bm25_weight <= 1 else 0.5,
              1.0 - (args.bm25_weight if 0 <= args.bm25_weight <= 1 else 0.5))
 
-    out_path = Path(args.out)
-    out_path.parent.mkdir(exist_ok=True, parents=True)
     w_bm25 = args.bm25_weight if 0 <= args.bm25_weight <= 1 else 0.5
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "n": len(ems),
-            "em": em_avg,
-            "f1": f1_avg,
-            "r1": r1_avg,
-            "r5": r5_avg,
-            "r10": r10_avg,
-            "paths": dict(paths),
-            "records": records,
-            "hybrid": {
-                "mode": args.hybrid_mode,
-                "w_bm25": w_bm25,
-                "w_dense": 1.0 - w_bm25,
-            },
-        }, f, ensure_ascii=False, indent=2)
-    log.info("Results → %s", out_path)
-    return 0
+    summary: Dict[str, Any] = {
+        "n": len(ems),
+        "em": em_avg,
+        "f1": f1_avg,
+        "r1": r1_avg,
+        "r5": r5_avg,
+        "r10": r10_avg,
+        "paths": dict(paths),
+        "hybrid": {
+            "mode": args.hybrid_mode,
+            "w_bm25": w_bm25,
+            "w_dense": 1.0 - w_bm25,
+        },
+    }
+    return summary, records
+
+
+def _log_ab_delta(
+    baseline: Dict[str, Any],
+    treatment: Dict[str, Any],
+) -> None:
+    """Log the metric delta between the baseline and the treatment run."""
+    log.info("=" * 68)
+    log.info("A/B RESULT   (baseline → treatment)")
+    log.info("            EM      F1      R@1     R@5     R@10")
+    for key, label in (
+        ("em", "EM"), ("f1", "F1"), ("r1", "R@1"),
+        ("r5", "R@5"), ("r10", "R@10"),
+    ):
+        b = baseline.get(key, 0.0)
+        t = treatment.get(key, 0.0)
+        log.info("  %-6s %.3f → %.3f   (%+.3f)", label, b, t, t - b)
+    log.info("=" * 68)
 
 
 # ─────────────────────────────────────────────────────────────────────
