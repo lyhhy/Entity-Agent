@@ -124,8 +124,6 @@ ATTR_GATE_TOP_K: int = 3
 from .sentence_graph import (  # noqa: E402
     ATTRIBUTE_DESCRIPTORS,
     ATTRIBUTE_NAMES,
-    ATTR_WEIGHTS,
-    ATTR_MOUNT_TOP_K,
 )
 
 # Minimum cosine for a sentence to be considered to carry a given
@@ -1038,12 +1036,18 @@ class StenGraphPipeline:
     def _step3_hyperedges_for_containers(
         self, container_ids: List[str],
     ) -> List[str]:
+        # NOTE: keep insertion order.  Returning `list(set(...))` made the
+        # order depend on Python's per-process string hash seed, so the
+        # same question could yield a different hyperedge sequence (and
+        # therefore a different B expansion) from one run to the next.
         seen: Set[str] = set()
+        ordered: List[str] = []
         for cid in container_ids:
             for he in self.he_registry.get_hyperedges_for_container(cid):
                 if he.id not in seen:
                     seen.add(he.id)
-        return list(seen)
+                    ordered.append(he.id)
+        return ordered
 
     # ------------------------------------------------------------------
     # [4] containers B: per-hyperedge ranked, then union

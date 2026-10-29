@@ -23,7 +23,7 @@ import math
 import threading
 import re
 
-from .sentence_graph import AttributeSlot, AttributeRegistry, AttributeMount
+from .sentence_graph import AttributeSlot, AttributeRegistry
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -1196,7 +1196,19 @@ class ContainerManager:
         dense_scores: Dict[str, float] = {cid: s for cid, s in dense_raw}
 
         # 3. Collect union of candidate container IDs.
-        all_cids: Set[str] = set(bm25_scores.keys()) | set(dense_scores.keys())
+        #    NOTE: build the union in a DETERMINISTIC order.  Iterating a
+        #    `set` here made the insertion order of `combined` below
+        #    depend on Python's per-process string hash seed; because the
+        #    final sort breaks score ties by insertion order, the same
+        #    query could return a different top-K on different runs.
+        bm25_cids = list(bm25_scores.keys())
+        dense_cids = list(dense_scores.keys())
+        all_cids: List[str] = []
+        _seen_cids: Set[str] = set()
+        for cid in bm25_cids + dense_cids:
+            if cid not in _seen_cids:
+                _seen_cids.add(cid)
+                all_cids.append(cid)
         if not all_cids:
             return []
 
@@ -1207,7 +1219,7 @@ class ContainerManager:
             if not raw_scores:
                 return {}
             sorted_cids = [cid for cid, _ in sorted(
-                raw_scores.items(), key=lambda kv: -kv[1]
+                raw_scores.items(), key=lambda kv: (-kv[1], kv[0])
             )]
             out: Dict[str, float] = {}
             for rank, cid in enumerate(sorted_cids, start=1):
@@ -1245,8 +1257,9 @@ class ContainerManager:
                 + w_dense * norm_dense.get(cid, 0.0)
             )
 
-        # 8. Sort by combined score.
-        ranked = sorted(combined.items(), key=lambda kv: -kv[1])[:top_k]
+        # 8. Sort by combined score.  Ties are broken by container id so
+        #    the result never depends on dict/set insertion order.
+        ranked = sorted(combined.items(), key=lambda kv: (-kv[1], kv[0]))[:top_k]
         return [
             (cid, score, norm_bm25.get(cid, 0.0), norm_dense.get(cid, 0.0))
             for cid, score in ranked
