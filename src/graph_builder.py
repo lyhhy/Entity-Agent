@@ -18,9 +18,9 @@ Builds two types of edges:
     - Max 1 hop for SAME_ENTITY during retrieval
 """
 
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 import spacy
-from spacy.tokens import Doc, Token
+from spacy.tokens import Doc
 
 from .entity_resolver import EntityResolver
 from .sentence_graph import (
@@ -59,7 +59,6 @@ class GraphBuilder:
 
 
 _SPACY_CACHE: Dict[str, object] = {}
-_SPACY_NER_ONLY_CACHE: Dict[str, object] = {}
 
 
 def _load_spacy_shared(model_name: str = "en_core_web_lg"):
@@ -87,48 +86,6 @@ def _load_spacy_shared(model_name: str = "en_core_web_lg"):
     _SPACY_CACHE[model_name] = nlp
     if "en_core_web_sm" not in _SPACY_CACHE:
         _SPACY_CACHE["en_core_web_sm"] = nlp
-    return nlp
-
-
-def _load_spacy_ner_only(model_name: str = "en_core_web_lg"):
-    """
-    Separate spaCy instance with all components except `ner` disabled.
-    Use this for bulk NER extraction where tagger/parser outputs are
-    not needed — saves ~40% RAM and ~2-3x speed.
-
-    Returns a separate object so disabling pipelines here never affects
-    the full pipeline used by graph_builder.
-    """
-    if model_name in _SPACY_NER_ONLY_CACHE:
-        return _SPACY_NER_ONLY_CACHE[model_name]
-    try:
-        import spacy
-        nlp = spacy.load(model_name)
-        disable = [
-            name for name in (
-                "tagger", "parser", "lemmatizer",
-                "attribute_ruler", "tok2vec",
-            )
-            if name in nlp.pipe_names and name != "ner"
-        ]
-        if disable:
-            nlp.select_pipes(disable=disable)
-    except OSError:
-        try:
-            import spacy
-            nlp = spacy.load("en_core_web_sm")
-            disable = [
-                name for name in (
-                    "tagger", "parser", "lemmatizer",
-                    "attribute_ruler", "tok2vec",
-                )
-                if name in nlp.pipe_names and name != "ner"
-            ]
-            if disable:
-                nlp.select_pipes(disable=disable)
-        except OSError:
-            nlp = None
-    _SPACY_NER_ONLY_CACHE[model_name] = nlp
     return nlp
 
 

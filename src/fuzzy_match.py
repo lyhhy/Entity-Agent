@@ -45,7 +45,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Sequence, Set, Tuple
+from typing import List, Optional, Sequence, Set, Tuple
 
 # ─────────────────────────────────────────────────────────────────
 # Stop words — dropped from token sets so that "the" / "of" do not

@@ -27,7 +27,6 @@ entity-linking or LLM-based coreference instead.
 """
 
 from typing import Dict, List, Optional, Any
-import re
 
 
 class EntityResolver:

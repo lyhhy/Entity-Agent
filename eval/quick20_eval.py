@@ -1191,7 +1191,6 @@ def _run_hyperedge_compare(
             text_b_for_llm = text_b
         # Re-run the LLM extraction with the augmented context.
         try:
-            from src.llm_client import DeepSeekClient as _DSC
             # Use the same span-extraction prompt as
             # extract_answer_from_dispatch by simulating a DispatchResult.
             class _FakeRes:

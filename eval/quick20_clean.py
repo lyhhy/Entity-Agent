@@ -27,14 +27,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import logging
 import os
 import random
 import sys
 import time
-from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -335,7 +333,7 @@ def main() -> int:
 
     # ── Per-question loop ──
     from src.dispatcher import build_dispatcher
-    from src.hyper_edge import HyperEdgeRegistry, merge_paragraph_hyperedges_into
+    from src.hyper_edge import HyperEdgeRegistry
 
     ems: List[bool] = []
     f1s: List[float] = []
@@ -389,11 +387,8 @@ def main() -> int:
                                 paragraph_title=str(_p_title),
                             )
 
-            # 段落级超边融合 (rule-based, no LLM) — TEMP DISABLED FOR DIAG
-            try:
-                pass  # merge_paragraph_hyperedges_into(he)
-            except Exception as _merge_exc:  # noqa: BLE001
-                print(f"[quick20] hyperedge merge skipped: {_merge_exc}")
+            # 段落级超边融合 (rule-based, no LLM) 已移除:
+            # merge_paragraph_hyperedges_into 随其依赖一并删除.
 
             disp = build_dispatcher(
                 builder, client=client, nlp=nlp,

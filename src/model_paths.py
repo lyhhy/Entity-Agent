@@ -41,10 +41,6 @@ Public API
         Return a local path, downloading the model into the local store
         first if it is not there yet.  Falls back to the original name
         when the download cannot be performed (e.g. no network).
-    local_embed_model_path() -> str
-        Absolute path to the local ``all-MiniLM-L6-v2`` directory.
-    local_cross_encoder_path() -> str
-        Absolute path to the local cross-encoder directory.
 """
 
 from __future__ import annotations
@@ -122,16 +118,6 @@ def resolve_model(name: str) -> str:
             return candidate
 
     return name
-
-
-def local_embed_model_path() -> str:
-    """Absolute path to the local `all-MiniLM-L6-v2` directory."""
-    return resolve_model("all-MiniLM-L6-v2")
-
-
-def local_cross_encoder_path() -> str:
-    """Absolute path to the local cross-encoder directory."""
-    return resolve_model("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 
 def _repo_for(name: str):

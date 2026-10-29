@@ -13,7 +13,6 @@ during retrieval operations.
 
 from dataclasses import dataclass, field
 from typing import List, Dict, Set, Optional, Tuple
-import uuid
 import re
 
 

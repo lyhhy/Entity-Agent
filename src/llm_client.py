@@ -35,7 +35,6 @@ Usage:
 
 from __future__ import annotations
 
-import json
 import os
 import logging
 import time
@@ -294,27 +293,8 @@ def make_summarizer(
 
 
 # ---------------------------------------------------------------------------
-# Convenience: detect whether any LLM is configured
-# ---------------------------------------------------------------------------
-
-def llm_available() -> bool:
-    """Return True if a DeepSeek/OpenAI key is present in the environment."""
-    return bool(
-        os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY")
-    )
-
-
-# ---------------------------------------------------------------------------
 # Client factory: local (self-hosted) LLM or hosted DeepSeek
 # ---------------------------------------------------------------------------
-
-def local_llm_configured() -> bool:
-    """
-    True when a local OpenAI-compatible server is configured via
-    STENRAG_LLM_BASE_URL.
-    """
-    return bool((os.environ.get(LOCAL_LLM_BASE_URL_ENV) or "").strip())
-
 
 def make_client(
     api_key: Optional[str] = None,

@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
@@ -322,47 +321,3 @@ def _parse_llm_response(text: str) -> Optional[QueryAnalysis]:
     )
 
 
-# ─────────────────────────────────────────────────────────────────
-# Container-name semantic matcher (used by retrievers to align
-# LLM-extracted entity names against container.entity strings).
-# ─────────────────────────────────────────────────────────────────
-def entity_to_container_match(
-    entity: str,
-    container_entity: str,
-    nlp=None,
-    threshold: float = 0.90,
-) -> float:
-    """
-    Return a similarity in [0, 1] between an LLM-extracted entity name
-    and a container's canonical entity name. Uses spaCy doc.vector
-    cosine (normalised to [0, 1]) when available, otherwise token
-    Jaccard. Threshold = 0.90 per spec.
-    """
-    if not entity or not container_entity:
-        return 0.0
-    e = entity.lower().strip()
-    c = container_entity.lower().strip()
-    if e == c or e in c or c in e:
-        return 1.0
-
-    if nlp is not None:
-        try:
-            va = nlp(entity).vector
-            vb = nlp(container_entity).vector
-            import numpy as np
-            na = float(np.linalg.norm(va))
-            nb = float(np.linalg.norm(vb))
-            if na > 0 and nb > 0:
-                cos = float(np.dot(va, vb) / (na * nb))
-                return max(0.0, min(1.0, (cos + 1.0) / 2.0))
-        except Exception:
-            pass
-
-    # Fallback: token overlap.
-    te = set(re.findall(r"\w+", e))
-    tc = set(re.findall(r"\w+", c))
-    if not te or not tc:
-        return 0.0
-    inter = te & tc
-    union = te | tc
-    return len(inter) / len(union) if union else 0.0

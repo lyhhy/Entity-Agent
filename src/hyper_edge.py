@@ -82,19 +82,6 @@ def parse_time_word(text: str) -> Tuple[str, str]:
     return ("", "")
 
 
-def time_ranges_overlap(a: Tuple[str, str], b: Tuple[str, str]) -> bool:
-    """
-    True iff two (start, end) ranges intersect. Empty string in any
-    side means "no constraint" → always overlaps.
-    """
-    if not a or not b:
-        return True
-    a_s, a_e = a
-    b_s, b_e = b
-    if not a_s or not a_e or not b_s or not b_e:
-        return True
-    # Lexicographic compare works because the format is ISO-like.
-    return not (a_e < b_s or b_e < a_s)
 
 
 @dataclass
@@ -763,84 +750,5 @@ class HyperEdgeRegistry:
         return ">30"
 
 
-def merge_paragraph_hyperedges_into(
-    registry: "HyperEdgeRegistry",
-    embedder: Optional[Any] = None,
-    low_freq_threshold: int = LOW_FREQ_THRESHOLD,
-    title_sim_threshold: float = TITLE_SIM_THRESHOLD,
-    max_merged_size: int = MAX_MERGED_SIZE,
-) -> Dict[str, Any]:
-    """
-    Convenience wrapper: build entity_freq from the registry's
-    `container_manager` and call `registry.merge_paragraph_hyperedges`.
-    Returns the stats dict.
-    """
-    cm = registry._container_manager
-    entity_freq: Dict[str, int] = {}
-    if cm is not None:
-        for c in cm.get_all_containers():
-            ent = (getattr(c, "entity", "") or "").lower().strip()
-            if ent:
-                entity_freq[ent] = entity_freq.get(ent, 0) + 1
-    if embedder is None and cm is not None:
-        embedder = getattr(cm, "embedder", None)
-    return registry.merge_paragraph_hyperedges(
-        entity_freq=entity_freq,
-        embedder=embedder,
-        low_freq_threshold=low_freq_threshold,
-        title_sim_threshold=title_sim_threshold,
-        max_merged_size=max_merged_size,
-    )
 
 
-# ─────────────────────────────────────────────────────────────────
-# Event-name semantic similarity (used by the dual-entity retriever
-# to decide if a hyperedge's event name matches the question).
-#
-# Implementation: spaCy doc.vector cosine similarity if spaCy is
-# available; falls back to token Jaccard. Both produce values in
-# [0, 1].  Threshold = 0.85 per spec.
-# ─────────────────────────────────────────────────────────────────
-def event_name_similarity(
-    name_a: str,
-    name_b: str,
-    nlp=None,
-    threshold: float = 0.85,
-) -> float:
-    """
-    Compute semantic similarity between two event-name strings.
-
-    Returns cosine similarity in [0, 1].
-    """
-    if not name_a or not name_b:
-        return 0.0
-    a_low = name_a.lower().strip()
-    b_low = name_b.lower().strip()
-    if a_low == b_low:
-        return 1.0
-
-    # Try spaCy vectors first.
-    if nlp is not None:
-        try:
-            doc_a = nlp(name_a)
-            doc_b = nlp(name_b)
-            va = doc_a.vector
-            vb = doc_b.vector
-            import numpy as np
-            na = float(np.linalg.norm(va))
-            nb = float(np.linalg.norm(vb))
-            if na > 0 and nb > 0:
-                cos = float(np.dot(va, vb) / (na * nb))
-                # Normalize from [-1, 1] to [0, 1]
-                return max(0.0, min(1.0, (cos + 1.0) / 2.0))
-        except Exception:
-            pass
-
-    # Fallback: token Jaccard.
-    ta = set(a_low.split())
-    tb = set(b_low.split())
-    if not ta or not tb:
-        return 0.0
-    inter = ta & tb
-    union = ta | tb
-    return len(inter) / len(union) if union else 0.0

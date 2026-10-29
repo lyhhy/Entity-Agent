@@ -675,20 +675,9 @@ def is_polar_question(question: str) -> bool:
 def is_yesno_question(question: str) -> bool:
     """True when the question is a polar (yes/no) question.
 
-    Kept as the strict polar test — see `is_polar_question`.  The old
-    prefix-only behaviour is available as `is_auxiliary_question` for
-    callers that only want the surface shape.
+    Kept as the strict polar test — see `is_polar_question`.
     """
     return is_polar_question(question)
-
-
-def is_auxiliary_question(question: str) -> bool:
-    """True when the question merely STARTS with an auxiliary verb.
-
-    This is a surface-shape test only.  It is true for both polar
-    questions and choice questions ("Is X or Y bigger?").
-    """
-    return (question or "").lower().strip().startswith(_YESNO_PREFIXES)
 
 
 # ─────────────────────────────────────────────────────────────────
