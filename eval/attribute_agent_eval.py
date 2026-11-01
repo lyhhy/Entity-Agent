@@ -15,7 +15,7 @@ Usage::
     # Dry run — detect gaps, propose, gate, report; nothing is applied.
     python eval/attribute_agent_eval.py --data eval/data/hotpot_dev_distractor_v1.json \
         --n 20 --rounds 10 --seed 1234 --dry-run
-
+ 
     # Apply — write the accepted delta and print a pasteable snippet.
     python eval/attribute_agent_eval.py --data eval/data/hotpot_dev_distractor_v1.json \
         --n 20 --rounds 10 --seed 1234 --out eval/results/attribute_schema.json
@@ -38,7 +38,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 # Force HF / sentence-transformers to use the local cache only — the
 # evaluation host has no outbound access, and a Hub HEAD request on
@@ -76,13 +76,15 @@ def run_attribute_agent(
     *,
     n_questions: int = 20,
     n_rounds: int = 10,
-    seed: int = 1234,
+    seed: Optional[int] = None,
     min_mount_count: int = 3,
     min_global_rate: float = 0.02,
     min_class_top_rate: float = 0.05,
     min_distinctiveness: float = 0.10,
     max_llm_calls: int = 200,
     use_llm: bool = True,
+    prune: bool = True,
+    prune_scope: str = "delta",
     apply: bool = True,
     client=None,
     schema=None,
@@ -101,8 +103,14 @@ def run_attribute_agent(
     Args:
         questions:       Either raw HotpotQA records or already-loaded
                          question dicts (see `load_questions`).
+        max_llm_calls:  Hard cap on LLM calls for this run.
+        use_llm:        Whether the LLM fallbacks may be used.
+        prune:          Whether the prune pass runs (drops the table
+                        entries whose mount efficiency collapsed).
+        prune_scope:    "delta" (default) or "all" — what the prune
+                        pass may touch.
         apply:          Apply the accepted delta to the live module
-                         tables.  When False it is a dry run.
+                        tables.  When False it is a dry run.
         schema:         An existing `AttributeSchema` to roll forward
                          from (already applied to the modules by the
                          caller).
@@ -157,6 +165,8 @@ def run_attribute_agent(
         min_distinctiveness_margin=min_distinctiveness,
         max_llm_calls=max_llm_calls,
         use_llm=use_llm,
+        prune=prune,
+        prune_scope=prune_scope,
     )
 
     agent = AttributeAgent(
@@ -174,7 +184,9 @@ def run_attribute_agent(
             json.dump(report.to_dict(), f, ensure_ascii=False, indent=2)
         log.info("Report  → %s", rp)
 
-    if schema_path and report.schema is not None and report.schema.attributes:
+    if schema_path and report.schema is not None and (
+        report.schema.attributes or report.schema.removed_attributes
+    ):
         sp = report.schema.save(schema_path)
         log.info("Schema  → %s", sp)
         snippet = report.schema.export_python()
@@ -189,11 +201,13 @@ def run_attribute_agent(
 def log_report(report: AgentReport) -> None:
     """Print the human-readable summary of an agent run."""
     log.info("=" * 68)
-    log.info("Sampled %d question draws over %d rounds",
-             report.n_sampled, report.n_rounds)
-    log.info("Gaps: %d   accepted: %d   rejected: %d   LLM calls: %d",
+    log.info("Sampled %d question draws over %d rounds (seed=%s)",
+             report.n_sampled, report.n_rounds,
+             report.seed if report.seed is not None else "?")
+    log.info("Gaps: %d   accepted: %d   rejected: %d   pruned: %d   "
+             "LLM calls: %d",
              len(report.gaps), len(report.accepted), len(report.rejected),
-             report.llm_calls)
+             len(report.pruned), report.llm_calls)
     log.info("-" * 68)
     for gap in report.gaps:
         log.info("[%s] %s :: %s  (fired %dx)",
@@ -203,6 +217,105 @@ def log_report(report: AgentReport) -> None:
         if gap.evidence:
             log.info("    evidence:  %s", gap.evidence[0][:100])
     log.info("=" * 68)
+    log_table_diff(report)
+
+
+# ---------------------------------------------------------------------------
+# Table diff: what was ADDED and what was REMOVED
+# ---------------------------------------------------------------------------
+
+def log_table_diff(report: AgentReport) -> None:
+    """
+    Print exactly what changed in the attribute table.
+
+    Three sections, because there are three different kinds of change:
+
+    * **ADDED** — a new attribute (or a new entity class) was accepted
+      and rolled into the table.
+    * **REMOVED** — an attribute (or class) that was in the table
+      BEFORE the run is no longer in it.  This is the PRUNE pass: the
+      agent drops the entries whose mount efficiency collapsed below
+      the gate ("如果这个属性后面挂载句子效率低就丢弃这个属性或者类").
+    * **REJECTED** — a gap that was detected but did NOT make it into
+      the table, with the reason why.  This is the "what was dropped
+      and why" section.
+    """
+    from src import sentence_graph as sg
+
+    schema = report.schema
+    added_attrs = sorted(schema.attributes.keys()) if schema else []
+    added_classes = sorted(schema.classes.keys()) if schema else []
+
+    log.info("-" * 68)
+    log.info("TABLE CHANGES")
+    log.info("-" * 68)
+    log.info("Table size now: %d attributes / %d entity classes",
+             len(sg.ATTRIBUTE_NAMES), len(sg._ATTRIBUTE_TEMPLATES))
+
+    if added_attrs:
+        log.info("")
+        log.info("ADDED attributes (%d):", len(added_attrs))
+        for name in added_attrs:
+            spec = schema.attributes[name]
+            owner = ",".join(spec.types) or "-"
+            log.info("  + %-20s owner=%-12s label=%s",
+                     name, owner, spec.label or "-")
+    else:
+        log.info("")
+        log.info("ADDED attributes: (none)")
+
+    if added_classes:
+        log.info("")
+        log.info("ADDED entity classes (%d):", len(added_classes))
+        for name in added_classes:
+            cspec = schema.classes[name]
+            attrs = ",".join(a.name for a in cspec.attributes) or "-"
+            log.info("  + %-20s attrs=%s", name, attrs)
+    else:
+        log.info("")
+        log.info("ADDED entity classes: (none)")
+
+    # REMOVED — the prune pass.  An attribute the agent dropped is no
+    # longer in `sg.ATTRIBUTE_NAMES`; a class it dropped is no longer
+    # in `sg._ATTRIBUTE_TEMPLATES`.
+    removed: List[str] = list(report.removed_attributes or [])
+    removed_classes: List[str] = list(report.removed_classes or [])
+    # Cross-check against the live table: an entry that was tombstoned
+    # in the schema is gone from the module tables too.
+    if schema:
+        for name in schema.attributes:
+            if name not in sg.ATTRIBUTE_NAMES and name not in removed:
+                removed.append(name)
+        removed_classes.extend(
+            t for t in schema.classes.keys()
+            if t not in sg._ATTRIBUTE_TEMPLATES and t not in removed_classes
+        )
+
+    log.info("")
+    if removed or removed_classes:
+        log.info("REMOVED / PRUNED (%d attributes, %d classes):",
+                 len(removed), len(removed_classes))
+        for name in removed:
+            log.info("  - %s", name)
+        for name in removed_classes:
+            log.info("  - class %s", name)
+    else:
+        log.info("REMOVED: (none — every table entry still mounts "
+                 "efficiently)")
+
+    if report.rejected:
+        log.info("")
+        log.info("REJECTED / DROPPED (%d):", len(report.rejected))
+        for gap in report.rejected:
+            log.info("  x %-18s [%s] %s", gap.attribute or "-",
+                     gap.entity_type, gap.reason)
+    if report.pruned:
+        log.info("")
+        log.info("PRUNED FROM THE TABLE (%d):", len(report.pruned))
+        for gap in report.pruned:
+            log.info("  - %-18s [%s] %s", gap.attribute or "-",
+                     gap.entity_type, gap.reason)
+    log.info("-" * 68)
 
 
 def main() -> int:
@@ -216,8 +329,16 @@ def main() -> int:
                     help="Questions drawn per round (default 20).")
     ap.add_argument("--rounds", type=int, default=10,
                     help="Rounds of sampling (default 10).")
-    ap.add_argument("--seed", type=int, default=1234,
-                    help="Base seed (default 1234).")
+    ap.add_argument(
+        "--seed", type=int, default=None,
+        help=(
+            "Base seed.  OMITTED by default: a fresh random seed is "
+            "drawn for every run, so each run explores the attribute "
+            "table from a different angle.  The seed that was used is "
+            "printed and stored in the report, so a run can be "
+            "reproduced by passing it back in."
+        ),
+    )
     ap.add_argument("--min-mount-count", type=int, default=3,
                     help="Min sentences an attribute must mount.")
     ap.add_argument("--min-global-rate", type=float, default=0.02,
@@ -232,6 +353,24 @@ def main() -> int:
                     help="Hard cap on LLM calls for this run.")
     ap.add_argument("--no-llm", action="store_true",
                     help="Disable the LLM fallbacks entirely.")
+    ap.add_argument(
+        "--no-prune", action="store_true",
+        help=(
+            "Disable the prune pass.  By default the agent DROPS the "
+            "table entries whose mount efficiency collapsed below the "
+            "gate (\"如果这个属性后面挂载句子效率低就丢弃这个属性或者"
+            "类\").  With this flag the table can only ever grow."
+        ),
+    )
+    ap.add_argument(
+        "--prune-scope", choices=["delta", "all"], default="delta",
+        help=(
+            "What the prune pass may touch.  'delta' (default) only "
+            "prunes the entries THIS agent added, so a hand-designed "
+            "base attribute is never deleted.  'all' lets it prune the "
+            "base table too."
+        ),
+    )
     ap.add_argument("--dry-run", action="store_true",
                     help="Report gaps and verdicts without applying them.")
     ap.add_argument(
@@ -309,6 +448,8 @@ def main() -> int:
         min_distinctiveness=args.min_distinctiveness,
         max_llm_calls=args.max_llm_calls,
         use_llm=not args.no_llm,
+        prune=not args.no_prune,
+        prune_scope=args.prune_scope,
         apply=not args.dry_run,
         client=client,
         schema=schema,
@@ -318,7 +459,9 @@ def main() -> int:
     )
 
     log_report(report)
-    if report.schema is None or not report.schema.attributes:
+    if report.schema is None or (
+        not report.schema.attributes and not report.schema.removed_attributes
+    ):
         log.info("No accepted attribute changes; schema not written.")
 
     return 0

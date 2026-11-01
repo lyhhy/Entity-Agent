@@ -81,6 +81,10 @@ _BUILD_GRAPH = q20.build_graph_from_hotpot
 _EXTRACT_ANSWER = q20.extract_answer_from_dispatch
 _APPLY_HYBRID = q20._apply_hybrid_config
 
+# R@k 的 gold 句子判定（与 quick20_eval 共用同一实现，避免两处漂移）。
+# 见 eval/recall_utils.py 的说明。
+_GOLD_MATCHER = q20.gold_sentence_matcher
+
 
 # ── Pretty console writer (handles GBK terminal) ───────────────────────────
 def _safe_print(s: str) -> None:
@@ -443,7 +447,12 @@ def main() -> int:
         f1s.append(f1)
 
         # ── R@K ──
-        gold_norm = _NORMALIZE(gold)
+        # Gold-matching follows the same rules as the main path
+        # (see eval/recall_utils.py): the dataset's `supporting_facts`
+        # annotation is authoritative, word-boundary answer containment
+        # is the fallback, and polar questions ('yes'/'no') are excluded
+        # from the denominator instead of being scored 0.
+        matcher = _GOLD_MATCHER(qdata, builder)
         final_sids: List[str] = []
         if res is not None and res.pipeline_result is not None:
             final_sids = list(
@@ -454,12 +463,18 @@ def main() -> int:
             if builder is None:
                 return False
             n = builder.sentence_registry.get_node(sid)
-            return n is not None and gold_norm in _NORMALIZE(n.text or "")
+            if n is None:
+                return False
+            return matcher.contains_answer(sid, n.text or "")
 
-        r1 = 1 if (final_sids and _contains_gold(final_sids[0])) else 0
-        r5 = 1 if any(_contains_gold(s) for s in final_sids[:5]) else 0
-        r10 = 1 if any(_contains_gold(s) for s in final_sids[:10]) else 0
-        r1s.append(r1); r5s.append(r5); r10s.append(r10)
+        if matcher.is_scorable:
+            r1 = 1 if (final_sids and _contains_gold(final_sids[0])) else 0
+            r5 = 1 if any(_contains_gold(s) for s in final_sids[:5]) else 0
+            r10 = 1 if any(_contains_gold(s) for s in final_sids[:10]) else 0
+            r1s.append(r1); r5s.append(r5); r10s.append(r10)
+        else:
+            # Polar question — R@k undefined, excluded from the mean.
+            r1 = r5 = r10 = 0
 
         # ── 收集 R@1 失败 (R@10 命中但 R@1 没命中) 案例 ──
         if r10 == 1 and r1 == 0 and disp is not None:
@@ -502,9 +517,12 @@ def main() -> int:
 
         # ── 干净输出: 一行 header + 三行 Q/G/A ──
         mark = "✓" if em_hit else "✗"
+        # Polar questions have no defined R@k — show "n/a" instead of a
+        # misleading 0, which would look like a retrieval miss.
+        _rk = (lambda v: "n/a") if not matcher.is_scorable else (lambda v: str(v))
         _safe_print(
             f"[{i+1:>2}/{args.n}] {qid[:8]}  EM={mark} F1={f1:.3f} "
-            f"R@1={r1} R@5={r5} R@10={r10}  ({latency_ms:.0f}ms)\n"
+            f"R@1={_rk(r1)} R@5={_rk(r5)} R@10={_rk(r10)}  ({latency_ms:.0f}ms)\n"
         )
         _safe_print(f"  Q : {question}\n")
         _safe_print(f"  G : {gold}\n")
@@ -550,13 +568,22 @@ def main() -> int:
     n = len(ems)
     em_avg = sum(ems) / max(1, n)
     f1_avg = sum(f1s) / max(1, n)
-    r1_avg = sum(r1s) / max(1, n)
-    r5_avg = sum(r5s) / max(1, n)
-    r10_avg = sum(r10s) / max(1, n)
+    # The R@k denominator is the SCORABLE question count.  Polar
+    # questions ('yes'/'no' gold) are excluded from `r1s` because no
+    # sentence can "contain" a yes/no answer — dividing by `n` here
+    # would silently charge them as misses and depress every R@k.
+    n_r = len(r1s)
+    r1_avg = sum(r1s) / max(1, n_r)
+    r5_avg = sum(r5s) / max(1, n_r)
+    r10_avg = sum(r10s) / max(1, n_r)
     _safe_print("=" * 80 + "\n")
     _safe_print(
         f"SUMMARY  n={n}  EM={em_avg:.3f}  F1={f1_avg:.3f}  "
         f"R@1={r1_avg:.3f}  R@5={r5_avg:.3f}  R@10={r10_avg:.3f}\n"
+    )
+    _safe_print(
+        f"  Recall denominator: {n_r} scorable / {n} total "
+        f"({n - n_r} polar excluded)\n"
     )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -572,7 +599,9 @@ def main() -> int:
     diag_path = diag_dir / "r1_failures.json"
     with open(diag_path, "w", encoding="utf-8") as f:
         json.dump({
-            "n_total": n,
+            "n_total": len(ems),
+            "n_r_scorable": len(r1s),
+            "n_polar_excluded": len(ems) - len(r1s),
             "n_r10_hit": sum(r10s),
             "n_r1_hit": sum(r1s),
             "n_r10_hit_but_r1_miss": len(r1_failure_top10),

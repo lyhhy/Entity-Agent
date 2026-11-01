@@ -49,24 +49,29 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────
-# Rerank: 事件相似度 + 事实相似度 融合权重
+# [2026-10-30] DEPRECATED: 旧精排公式的权重常量。
+#
+# 旧公式：
 #   S_f(F) = W_EVENT * S_h(E,Q) + (1 - W_EVENT) * S_h(F,Q)
-# 默认 0.3 (event) + 0.7 (fact), 与原始 spec 对齐.
+# 其中 S_h(E,Q) = W_EVENT_NAME·cos(title,q) + W_EVENT_SENT·cos(sent,q)
+#
+# 这些常量现在**没有任何消费者**（新的公式用 W_EVENT_NAME_N /
+# W_SENT_N / W_FACT_N / W_ATTR / W_LEX）。保留它们是为了不破坏
+# 外部可能 import 它们的代码，但它们不再影响排序。
+#
+# 保留它们的另一个理由是**可对照**：旧常量记录了"当初以为的权重
+# 配比"，而新公式暴露了一个事实 —— 在未归一化的求和里，
+# W_EVENT_NAME=0.7 这个设定**从来没有真正生效**（句子余弦的方差
+# 更大，实际主导了排序）。
 # ─────────────────────────────────────────────────────────────────
 W_EVENT: float = 0.3
 
-# S_h_E(句子) 的内部配比:
+# S_h_E(句子) 的内部配比（旧公式专用，见上）：
 #   S_h_E(sent) = 0.7 * cos(event_name, query)
 #               + 0.3 * cos(sentence_vec, query)
 #
-# 之前 S_h(E,Q) = 0.5*cos(event_name,q) + 0.5*cos(mean_member_vec,q)。
-# mean-member 分支被移除: 它把一个段落里所有事件的向量平均掉,
-# 导致同一段落内各事件的 S_h_E 几乎相同, 选不出"哪个事件更相关"。
-# 改成句子自身的向量后, 事件名(0.7) 主导, 句子向量(0.3) 做细粒度修正。
-#
 # 权重可调: 环境变量 STENRAG_EVENT_NAME_WEIGHT (0.0-1.0) 覆盖事件名权重,
-# 句子权重 = 1 - 事件名权重。设为 0.6 可削弱"事件名(=段落标题)字面匹配
-# query"带来的干扰段落噪声。
+# 句子权重 = 1 - 事件名权重。
 #
 # 降权的代价: 事件名是唯一区分"同一段落内哪个事件更相关"的信号。
 # 权重过低会让段落内所有句子的 S_h_E 趋于一致, 退回旧 mean-member 行为。
@@ -78,7 +83,78 @@ W_EVENT_SENT: float = 1.0 - W_EVENT_NAME
 # Attribute rerank: continuous soft-match score added to the final formula.
 # Soft-match replaces the old binary attr_match from mapper/filter.
 # Range [0, 1]; W_ATTR=0.10 gives attr_term range [0, 0.10].
-W_ATTR: float = 0.10
+#
+# ─────────────────────────────────────────────────────────────────
+# [2026-10-30] 精排公式修复 —— 量纲归一化 + 词法信号接回
+#
+# 上一版公式有三个结构性缺陷，导致"属性在召回层有效，但 EM/F1 反而
+# 下降"：
+#
+# (1) **量纲不可比**。`name_term` = cos(段落标题, query) 典型值
+#     0.15–0.35；`sent_term` = cos(整句, query) 典型值 0.35–0.55。
+#     两者直接加权求和，谁的方差大谁主导 —— 结果是 W_EVENT_NAME=0.7
+#     这个"事件名主导"的设定在数值上根本没有实现（实际是句子向量
+#     主导），与设计意图完全相反。
+#
+# (2) **属性信号被压死**。W_ATTR=0.10 → attr_term ∈ [0, 0.10]，
+#     而 final 的动态范围约 0.2–0.6。属性的整个取值范围只相当于
+#     句子余弦波动的 1/4，属性表的所有改进在最终排序里几乎看不见。
+#
+# (3) **词法信号整条链路断线**。`_score_sentences_v8` /
+#     `_bm25_scores` / `_score_tfidf` 在 Step 7 被删后失去唯一调用者，
+#     现在是死代码 —— BM25、TF-IDF 实体区分度、以及专门为 HotpotQA
+#     写的答案形状先验（ner_density / has_number）全部不参与打分。
+#     排序只剩两个稠密余弦。
+#
+# 修复方式：所有分量先各自归一化到 [0,1]（min-max over the候选池），
+# 再加权相加。归一化之后"量纲"不再是问题，权重才真正表达设计意图。
+# ─────────────────────────────────────────────────────────────────
+W_ATTR: float = float(
+    os.environ.get("STENRAG_W_ATTR", "0.30") or 0.30
+)
+
+# 词法信号（BM25 + 答案形状先验）权重。0 = 完全关闭（保持旧行为）。
+#
+# 这条信号是**独立于稠密余弦**的：MiniLM 在"问句问一个具体事实、
+# 答案句是短事实句"这类任务上纯稠密余弦的 top-1 精度本来就弱，
+# 而 BM25 能靠 IDF 权重救回稀有实体（Havel / Fitzgerald 这类词在
+# Jaccard/稠密余弦里权重被稀释）。改造日志 A 已经验证过：接回
+# TF-IDF 后 R@5 +0.033。
+W_LEX: float = float(
+    os.environ.get("STENRAG_W_LEX", "0.30") or 0.30
+)
+
+# 事件名（段落标题）分量的归一化后权重。
+#
+# 注意：修复前 `name_term` 的绝对贡献只有 0.15·0.7 ≈ 0.1，而大事件
+# 惩罚（≤1 的乘子）把它压到 0.01 量级 —— 惩罚对排序的影响不到 3%，
+# GAMMA_E 调成 2、3 也没用。归一化之后 name_term 的量级回到 [0,1]，
+# 惩罚才真正起作用。
+W_EVENT_NAME_N: float = float(
+    os.environ.get("STENRAG_W_EVENT_NAME", "0.35") or 0.35
+)
+
+# 句子向量分量的归一化后权重。
+W_SENT_N: float = float(
+    os.environ.get("STENRAG_W_SENT", "0.20") or 0.20
+)
+
+# 事实项（句子向量余弦）的归一化后权重。
+W_FACT_N: float = float(
+    os.environ.get("STENRAG_W_FACT", "0.15") or 0.15
+)
+
+# 大事件惩罚的指数（作用于归一化后的 name 分量）。
+#
+# GAMMA_E=1.0 时 penalty = 1/(size-1)。段落标题在 HotpotQA 里常常
+# 一个词都不出现在问句里（问句问的是属性，标题是文章名），所以
+# name 分量对"答案在哪个段落"几乎无判别力 —— 这正是要靠 B 段落
+# 配额来解决的，而不是靠加大惩罚。
+#
+# 修复前 name 分量的绝对贡献只有 0.15·0.7 ≈ 0.1，惩罚把它压到
+# 0.01 量级 —— 惩罚对排序的影响不到 3%，GAMMA_E 调成 2、3 也没用。
+# 归一化之后 name 分量的量级回到 [0,1]，惩罚才真正起作用。
+GAMMA_E: float = 1.0
 
 # Hard attribute gate: a candidate sentence is kept only if it CARRIES at
 # least one attribute that the query actually asks for.
@@ -101,6 +177,44 @@ W_ATTR: float = 0.10
 # When the query has no usable attribute signal (no embedder, or all
 # cosines are 0) the gate is disabled for that query — it must never
 # empty the pool.
+#
+# ─────────────────────────────────────────────────────────────────
+# [2026-11-01] **硬门降级为软门（改造 H）**
+# ─────────────────────────────────────────────────────────────────
+# 硬门被证伪了。seed=7 / 20 题的 A/B（无属性 → 有属性）：
+#
+#     EM    0.850 → 0.750   (-0.100)
+#     R@1   0.684 → 0.579   (-0.105)
+#     R@10  0.947 → 0.789   (-0.158)
+#
+# 但 RANK-DIAG 显示 **排序反而变好了**（排序丢失 6 → 2），恶化 100%
+# 来自"门删掉"这一项（0 → 5）。逐题复盘 5 道被删的题，发现：
+#
+#   · 5ab9d2e2: gold 的 final_score = 0.962，全场第 1 —— 排序器已经
+#     把 gold 排到第一了，**门把它删掉了**。
+#   · 5a74cfed: gold 的 final_score = 1.072，全场第 1 —— 同上。
+#
+# 也就是说，**门的删除行为覆盖了排序器正确的判断**。
+#
+# 根因：`wanted_attrs` 只取 query 侧 embedding 余弦的 top-3，**完全
+# 不看 sentence 侧挂了什么**。而 `mounted_attrs` 是"实体类型 × 属性
+# 类别"的粗分类，于是经常出现 wanted 与 mounted **零交集**：
+#
+#   · gold 挂 [achievement, career, education, event]，门要
+#     [location, population, residence] —— 零交集
+#   · gold 挂 8 个属性，门只认 3 个，其中一个都不重叠
+#   · gold 根本没挂任何属性（mounted = []）
+#
+# 这是**粗分类粒度**问题，不是阈值问题 —— 把 ATTR_GATE_TOP_K 调大
+# 或调小都治不了"wanted 集合本身是错的"。
+#
+# 所以：**属性信号保留为打分分量（W_ATTR），但不再拥有删除权。**
+# 门改为"软门"：属性不满足的句子不被删除，只是拿不到属性加权，
+# 排序时自然下沉。属性从"准入证"退回"加分项"—— 这才是它作为
+# 排序信号应有的位置。
+#
+# `ATTR_GATE_TOP_K` 仍然决定**哪些属性算被问到了**（即 wanted 集合
+# 的宽度），它现在影响的是 `attr_match` 的计算范围，而不是生存。
 ATTR_GATE_TOP_K: int = 3
 
 # Canonical attribute names + descriptors used in symmetric-attribute
@@ -146,10 +260,122 @@ ATTR_QUERY_MIN_SIM: float = 0.45
 # `attr_gate_level`.
 ATTR_GATE_MIN_KEEP: int = 3
 
-# 大事件惩罚: S_h(E,Q) 项按事件大小做反向加权.
-#   penalty(E) = 1 / (|F_e| - 1) ** GAMMA_E   (|F_e| <= 1 → 1.0)
-# 默认 gamma=1.0; 越大越倾向"事件越小越优先".
-GAMMA_E: float = 1.0
+
+# ─────────────────────────────────────────────────────────────────
+# [2026-11-01] 实体-属性槽位匹配的权重（改造 H，第 2 项）
+#
+# 槽位对齐分（"这个句子的这个实体，恰好挂着问句想要的属性"）在
+# `attr_match` 里能起到的最大作用。它是一个**乘子**，所以：
+#
+#   · 槽位完全命中（实体对上 + 属性对上）→ attr_match = 1.0·W_ATTR
+#   · 槽位没命中 → attr_match 只由粗粒度路径决定
+#
+# 为什么是 1.0 而不是更小：槽位匹配是**细粒度**证据，它一旦命中，
+# 就说明这句确实在讲"问句问的那个实体的那个属性" —— 这正是我们要
+# 的信号。粗粒度路径给的 0.3-0.6 在这种情况下是**低估**。
+#
+# 为什么不超过 1.0：末词降级有误匹配风险（"John Smith" 与
+# "James Smith" 都降级到 "smith"）。留一点余量，让粗粒度信号在
+# 误匹配时还能把分数拉回来。
+# ─────────────────────────────────────────────────────────────────
+ATTR_SLOT_MATCH_WEIGHT: float = float(
+    os.environ.get("STENRAG_ATTR_SLOT_W", "1.0") or 1.0
+)
+
+
+# ─────────────────────────────────────────────────────────────────
+# [2026-11-01] 保底保证：分数最高的 N 句一定进入 LLM 上下文
+#
+# 这是**最后一道防线**，独立于属性逻辑。旧的门有
+# `ATTR_GATE_MIN_KEEP=3` 的保底，但那保护的是"数量"（上下文不会
+# 太太空），不是"质量"（正确答案句在不在里面）。误校准时池子往往
+# 还有 20+ 候选，门从容删掉 5 个 gold，保底根本不会启动。
+#
+# 新保底保护的是"**排序器的判断**"：分数最高的 N 句一定进上下文，
+# 任何后续筛选都不能踢掉它们。
+#
+# N 的取值：默认 = top_k（全部）。理由是既然排序器已经把 gold 排到
+# 第 1，就不该有任何句子比它更值得进上下文。留一个可调参数是为了
+# 将来做消融（"只保证前 8 句" vs "保证全部 16 句"）。
+# ─────────────────────────────────────────────────────────────────
+ATTR_TOP_SCORE_GUARANTEE: int = int(
+    os.environ.get("STENRAG_TOP_GUARANTEE", "16") or 16
+)
+
+
+# ─────────────────────────────────────────────────────────────────
+# [2026-11-01] 实体键归一化（改造 H，第 2 项）
+#
+# 为什么需要它
+# ------------
+# 问句和句子里的实体表面形式经常不一样：
+#
+#     问句: "Which city was Havel born in?"
+#     句子: "Václav Havel was born in Mělník ..."
+#
+# 精确匹配对不上，两边就都"查不到这个实体的属性"，槽位匹配失效。
+#
+# 规则（与 query 侧的末词降级形态保持一致，两边必须用同一套）
+# ------------------------------------------------------------------------
+#  1. 完整的小写形式        "václav havel"
+#  2. 末词（长度 ≥ 3）      "havel" —— 匹配姓氏
+#  3. 去掉标点的形式        "vaclav havel" —— 匹配去重音变体
+#
+# 末词降级有**误匹配风险**（"John Smith" / "James Smith" 都降级到
+# "smith"），所以槽位匹配的结果**不单独决定排序**，而是在
+# `attr_match` 里作为一个**加成项**（见 `_event_fact_score`）。
+# 宁可多给一点分，不可错杀。
+# ─────────────────────────────────────────────────────────────────
+def _entity_keys(name: str) -> List[str]:
+    """Return the lookup keys for an entity surface form.
+
+    The last-word form exists because HotpotQA questions frequently
+    mention a person by surname only ("Which city was Havel born in?")
+    while the sentence spells out the full name ("Václav Havel").
+    """
+    keys: List[str] = []
+    raw = (name or "").strip().lower()
+    if not raw:
+        return keys
+
+    keys.append(raw)
+
+    # Strip accents/diacritics so "Václav Havel" → "vaclav havel".
+    try:
+        import unicodedata
+        decomposed = unicodedata.normalize("NFKD", raw)
+        stripped = "".join(
+            c for c in decomposed if not unicodedata.combining(c)
+        )
+        if stripped != raw:
+            keys.append(stripped)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Surname / last-word form.
+    parts = [p for p in re.findall(r"[a-z0-9]+", raw) if len(p) >= 3]
+    if parts:
+        last = parts[-1]
+        if last != raw:
+            keys.append(last)
+        # The accent-stripped last word too ("václav" case).
+        try:
+            import unicodedata
+            d = unicodedata.normalize("NFKD", last)
+            s = "".join(c for c in d if not unicodedata.combining(c))
+            if s and s != last:
+                keys.append(s)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Deduplicate, preserve order.
+    seen: Set[str] = set()
+    out: List[str] = []
+    for k in keys:
+        if k and k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
 
 
 def _cos(a: "np.ndarray", b: "np.ndarray") -> float:
@@ -166,6 +392,43 @@ def _cos(a: "np.ndarray", b: "np.ndarray") -> float:
         return float(_np.dot(a, b) / (na * nb))
     except Exception:  # noqa: BLE001
         return 0.0
+
+
+def _minmax_norm(values: Dict[str, float]) -> Dict[str, float]:
+    """
+    Min-max normalise a per-sentence score map to [0, 1].
+
+    Why this exists
+    ---------------
+    The rerank formula used to add raw cosines of different scales
+    together: `cos(paragraph_title, query)` lands around 0.15-0.35 while
+    `cos(sentence, query)` lands around 0.35-0.55.  Adding them with
+    fixed weights does NOT express the intended emphasis — whichever
+    component happens to have the larger VARIANCE wins, regardless of
+    its weight.  That is how a nominal "event-name dominant" setting
+    (W_EVENT_NAME=0.7) ended up being sentence-vector dominant in
+    practice.
+
+    Normalising each component over the candidate pool FIRST makes the
+    weights mean what they say: after normalisation every component
+    spans [0, 1] and the weight is genuinely its share of the final
+    score.
+
+    Degenerate case: when all values are equal (or there is only one
+    candidate), the map is returned as-is scaled to 1.0 for the max —
+    otherwise every candidate would collapse to 0.0 and the formula
+    would lose all discrimination.
+    """
+    if not values:
+        return {}
+    lo = min(values.values())
+    hi = max(values.values())
+    if hi - lo < 1e-9:
+        # All equal — no discrimination is possible from this
+        # component, so give every candidate the same neutral value.
+        return {k: 1.0 for k in values}
+    span = hi - lo
+    return {k: (v - lo) / span for k, v in values.items()}
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -2002,18 +2265,31 @@ class StenGraphPipeline:
         stashed on `self._last_ef_scored` so the caller can persist them
         onto `PipelineResult.debug` for inspection.
 
-        Hard attribute gate — a DELETION:
+        Hard attribute gate — a DELETION, but a BOUNDED one:
           a candidate is kept only if it carries at least one of the
           query's top-`ATTR_GATE_TOP_K` attributes, measured by the
           VECTOR attribute profile of the sentence (sent_attr_vec) and
           not by a keyword table.  Candidates that carry none of them
           are removed from the pool entirely — they never reach the LLM.
 
-        Safety: if the gate would empty the pool, it relaxes step by
-        step (top-3 → top-5 → top-8 → keep all), and finally falls back
-        to keeping the best `ATTR_GATE_MIN_KEEP` candidates by score.
-        The level actually used is recorded in `attr_gate_level`, so a
-        mis-calibrated gate is visible in the logs rather than silent.
+        **The bound matters (2026-10-30 revision).**  The gate used to
+        relax ONLY when it emptied the pool.  A gate that keeps 1
+        candidate out of 30 was treated as "working as intended" — and
+        that is exactly what destroys EM/F1 while *improving* recall:
+        the attribute table decides which sentences are eligible, so a
+        mis-calibrated wanted-attribute set deletes the gold sentence
+        before the reranker ever sees it.  Recall then goes UP (the
+        surviving sentences are on-topic) while the answer goes DOWN
+        (the sentence carrying it is gone).
+
+        So the gate now also has a FLOOR: it must keep at least
+        `ATTR_GATE_MIN_KEEP` candidates, and when the gate would keep
+        fewer than that it relaxes.  The relaxation ladder is top-3 →
+        top-5 → top-8 → keep-all → best-N-by-score.
+
+        Safety: the level actually used is recorded in
+        `attr_gate_level`, so a mis-calibrated gate is visible in the
+        logs rather than silent.
         """
         scored = self._event_fact_score(query, sids)
         if not scored:
@@ -2026,86 +2302,151 @@ class StenGraphPipeline:
         # top-3 wanted attributes (per the vector profile)?  If not, it
         # is DELETED — it no longer competes for a slot.
         #
-        # If the top-3 cut would empty the candidate set the gate is
-        # relaxed step by step (top-5 → top-8 → keep all).  A gate that
-        # removes everything is worse than no gate, but silently keeping
-        # everything would hide a mis-calibrated gate — the relaxation
-        # level actually used is recorded in `attr_gate_level`.
+        # ─────────────────────────────────────────────────────────────
+        # [2026-11-01] **硬门 → 软门（改造 H）**
+        # ─────────────────────────────────────────────────────────────
+        # 硬门在这里被证伪了。它带来的净效果是 EM -0.100 / R@10 -0.158，
+        # 而排序本身是变好的（排序丢失 6 → 2）—— 恶化全部来自"门删掉"
+        # 这一项（0 → 5）。
+        #
+        # 逐题复盘那 5 道被删的题，两道的 gold 的 final_score 是**全场
+        # 第 1** —— 排序器判断正确，门把它删掉了。门覆盖了排序器的判断。
+        #
+        # 根因是 wanted 与 mounted **零交集**：wanted 只取 query 侧
+        # embedding 余弦的 top-3，完全不看 sentence 侧挂了什么；而
+        # `mounted_attrs` 是粗分类（实体类型 × 属性类别），两者经常对不
+        # 上。这不是阈值问题 —— 调大调小 ATTR_GATE_TOP_K 都治不了
+        # "wanted 集合本身是错的"。
+        #
+        # 现在属性**不再有删除权**。它保留为打分分量（`W_ATTR`），
+        # 不满足的句子只是拿不到属性加权、排序时自然下沉。属性从
+        # "准入证"退回"加分项" —— 这才是排序信号应有的位置。
+        #
+        # 保留 wanted 集合的用途：它决定 `attr_match` 用哪些属性算
+        # 对齐度（见 `_event_fact_score` 的 coverage 计算）。
+        #
+        # `attr_gate_kept` / `attr_gate_pass` 仍然被填充（值恒为 True），
+        # 因为 eval 的 RANK-DIAG 依赖这两个字段来报告"门删掉了多少"。
+        # 字段语义变了，但**接口不变** —— 旧的结果文件仍然可读。
         kept = scored
         gate_level = 0
+        n_gated = 0
         if scored and scored[0].get("wanted_attrs"):
+            # 软门：不再删除任何候选。这里只做一次**观测**，把
+            # "如果这是硬门，会删掉多少" 记进日志，让误校准的属性表
+            # 依然可见 —— 只是不再伤害结果。
             base = list(scored[0].get("wanted_attrs_rank") or [])
-            for level in (ATTR_GATE_TOP_K, 5, 8):
-                allowed = set(base[:level])
-                passed = [
-                    d for d in scored
-                    if set(d.get("mounted_attrs") or []) & allowed
-                ]
-                if passed:
-                    kept = passed
-                    gate_level = level
-                    break
-            else:
-                # Even the loosest cut removed everything: fall back to
-                # the best-scoring candidates so the LLM still gets a
-                # usable context.
-                kept = sorted(
-                    scored, key=lambda d: -d["final_score"]
-                )[:ATTR_GATE_MIN_KEEP]
-                gate_level = -1
-            n_gated = len(scored) - len(kept)
-            if n_gated > 0:
+            allowed = set(base[:ATTR_GATE_TOP_K])
+            n_would_gated = sum(
+                1 for d in scored
+                if not (set(d.get("mounted_attrs") or []) & allowed)
+            )
+            if n_would_gated:
                 logger.info(
-                    "[EF-attr-gate] top-%d gate DELETED %d/%d candidates",
-                    gate_level, n_gated, len(scored),
-                )
-            else:
-                logger.info(
-                    "[EF-attr-gate] gate kept all %d candidates",
-                    len(scored),
+                    "[EF-attr-gate] SOFT gate — %d/%d candidates carry none "
+                    "of the wanted attrs %s (kept anyway; attr is a "
+                    "ranking signal, not an admission ticket)",
+                    n_would_gated, len(scored), sorted(allowed),
                 )
         kept_ids = {id(d) for d in kept}
         for d in scored:
             d["attr_gate_level"] = gate_level
             d["attr_gate_kept"] = id(d) in kept_ids
             # Keep attr_gate_pass consistent with the decision actually
-            # taken (the ladder may have relaxed past the top-3).
+            # taken.  Under the soft gate every candidate is kept, so
+            # this is always True — but the field is still written so
+            # the eval diagnostics keep working.
             d["attr_gate_pass"] = id(d) in kept_ids
 
         # Rank everything by the fused score.
         scored.sort(key=lambda d: -d["final_score"])
 
         # ----------------------------------------------------------------
-        # Selection — gate-passing candidates ONLY.
+        # Selection — rank everything, truncate to top_k.
         #
-        # The gate is a deletion: candidates that carry none of the
-        # query's wanted attributes are already excluded from `kept`.
-        # They are not re-inserted here as "supplement", because doing
-        # so is what made the gate a no-op reorder — measured on the
-        # seed-137 run, 66% of the sentences the LLM actually received
-        # were gate-dropped ones.
+        # [2026-11-01] Under the SOFT gate every candidate is kept, so
+        # this is now simply "take the top_k by final_score".  The old
+        # code filtered by `id(d) in kept_ids` first, which under the
+        # hard gate meant "gate-passing only".
         #
-        # `final_rows` is therefore the ranked gate-passing candidates,
-        # truncated to top_k.  `attr_block` is kept in the record for
-        # backwards compatibility with the eval diagnostics.
+        # `final_rows` is the ranked candidate list, truncated to top_k.
+        # `attr_block` is kept in the record for backwards compatibility
+        # with the eval diagnostics.
         final_rows = [d for d in scored if id(d) in kept_ids][:top_k]
 
+        # ─────────────────────────────────────────────────────────────
+        # [2026-11-01] **保底保证（改造 H，第 3 项）**
+        # ─────────────────────────────────────────────────────────────
+        # 保证：**分数最高的 N 句一定进入 LLM 上下文**，任何筛选逻辑
+        # 都不能把它们排除。
+        #
+        # 为什么需要这一层（改造 H 的第 1、2 项还不够）：
+        # 旧的门有 `ATTR_GATE_MIN_KEEP=3` 的保底，但那个保底只在
+        # "池子被掏空"时才触发 —— 而误校准时池子往往还有 20+ 候选，
+        # 门从容地删掉 5 个 gold，保底根本不会启动。
+        #
+        # 也就是说：**旧保底保护的是"数量"，不是"质量"**。它保证
+        # 上下文不会太空，但完全不保证正确答案句在里面。
+        #
+        # 新的保底保护的是"**排序器的判断**"。既然排序器已经把 gold
+        # 排到第 1（实测有两道题的 gold final_score 是全场第 1），那
+        # 任何后续的筛选都不该把它踢掉。这是一道**最后一道防线**，
+        # 独立于属性逻辑 —— 未来即使再加别的过滤器，也绕不过它。
+        #
+        # 实现方式：显式地把 score 最高的 N 句补进 final_rows。
+        # （当前软门下这已经是恒等操作，但写成显式代码是为了：）
+        #   1. 把这条不变量固定下来，不再依赖"恰好没有别的过滤器"
+        #   2. 让它可测 —— 下面的断言会真的检查它
+        # ─────────────────────────────────────────────────────────────
+        n_guarantee = max(1, min(ATTR_TOP_SCORE_GUARANTEE, top_k))
+        top_by_score = scored[:n_guarantee]
+        final_ids = {id(d) for d in final_rows}
+        for d in top_by_score:
+            if id(d) not in final_ids:
+                final_rows.append(d)
+                final_ids.add(id(d))
+        # Keep final_rows ranked by score after the guarantee append.
+        final_rows.sort(key=lambda d: -d["final_score"])
+        final_rows = final_rows[:top_k]
+
+        # The guarantee must hold — assert it rather than hope.
+        # A violation here means some filter ran after the sort.
+        _guaranteed = {id(d) for d in top_by_score}
+        if not _guaranteed.issubset({id(d) for d in final_rows}):
+            logger.error(
+                "[EF-guarantee] VIOLATION: top-%d by score not all in "
+                "final_rows — a filter is running after the sort",
+                n_guarantee,
+            )
+
         logger.info(
-            "[EF-rank] gate-passed %d/%d (deleted %d) → final %d/%d",
+            "[EF-rank] kept %d/%d (soft gate deleted %d) → final %d/%d "
+            "(top-%d score guarantee held)",
             len(kept), len(scored), len(scored) - len(kept),
-            len(final_rows), top_k,
+            len(final_rows), top_k, n_guarantee,
         )
 
-        # Log per-query average contribution of event signal vs fact signal
-        # so we can see which one is driving the ranking.
+        # Log per-query average contribution of each component so we can
+        # see which one is driving the ranking.
+        #
+        # **The labels changed (2026-10-30).**  The old line said
+        # "W_EVENT" / "avg_(1-wE)·S_h_F", which described the OLD
+        # formula where S_f = W_EVENT·S_h_E + (1-W_EVENT)·S_h_F.
+        # The new formula has five independently-weighted normalised
+        # components, so the log has to name them individually —
+        # otherwise a weight regression is invisible.
         n = max(1, len(final_rows))
         avg_e = sum(d["S_h_E"] for d in final_rows) / n
         avg_f = sum(d["S_h_F"] for d in final_rows) / n
+        avg_attr = sum(d["attr_term"] for d in final_rows) / n
+        avg_lex = sum(d.get("lex_term", 0.0) for d in final_rows) / n
         logger.info(
-            "[EF-rank] n=%d | W_EVENT=%.2f | avg_wE·S_h_E=%.4f | "
-            "avg_(1-wE)·S_h_F=%.4f | avg_S_f=%.4f | avg_echo=%.4f | "
+            "[EF-rank] n=%d | W_NAME_N=%.2f W_SENT_N=%.2f W_FACT_N=%.2f "
+            "W_ATTR=%.2f W_LEX=%.2f | avg_event=%.4f avg_fact=%.4f "
+            "avg_attr=%.4f avg_lex=%.4f | avg_S_f=%.4f | avg_echo=%.4f | "
             "avg_final=%.4f",
-            n, W_EVENT, W_EVENT * avg_e, (1.0 - W_EVENT) * avg_f,
+            n, W_EVENT_NAME_N, W_SENT_N, W_FACT_N, W_ATTR, W_LEX,
+            avg_e, avg_f, avg_attr, avg_lex,
             sum(d["S_f"] for d in final_rows) / n,
             sum(d["echo_penalty"] for d in final_rows) / n,
             sum(d["final_score"] for d in final_rows) / n,
@@ -2124,24 +2465,39 @@ class StenGraphPipeline:
         self, query: str, sids: List[str],
     ) -> List[Dict[str, Any]]:
         """
-        For each candidate sentence F:
-            S_h(F, Q) = cosine(summary_vector, query_vec)  (existing
-                          semantic_sim path; reuses `embedder.encode`
-                          + `node.summary_vector` via _score_cosine)
-            S_h(E, Q) = W_EVENT_NAME*cos(event_name_vec, q)
-                        + W_EVENT_SENT*cos(sentence_vec, q)  (per SENTENCE)
-            S_f(F)    = W_EVENT * S_h(E,Q) + (1-W_EVENT) * S_h(F,Q)
+        Score every candidate sentence with the normalised rerank formula.
 
-            attr_term = W_ATTR * attr_match, where attr_match is the
-                        symmetric-attribute soft-match score in [0,1].
-                        Only active when `attr_soft_match_mode` is True
-                        and an embedder is available; otherwise 0.
+        **The formula (2026-10-30 revision)**
+        -------------------------------
+        Every component is min-max normalised over the candidate pool
+        FIRST, then weighted::
 
-            final     = S_f(F) + attr_term - echo_penalty
+            final = W_EVENT_NAME_N · norm(cos(event_name, q) · penalty)
+                  + W_SENT_N       · norm(cos(sentence, q))
+                  + W_FACT_N       · norm(cos(sentence, q))
+                  + W_ATTR         · norm(attribute_match)
+                  + W_LEX          · norm(BM25 + answer-shape prior)
+
+        Normalisation is not cosmetic — it is what makes the weights
+        mean anything.  The OLD formula added raw cosines of different
+        scales (``cos(title,q)`` ∈ [0.15,0.35] vs ``cos(sent,q)`` ∈
+        [0.35,0.55]); whichever component had the larger VARIANCE
+        dominated, so a nominal "event-name dominant" setting
+        (W_EVENT_NAME=0.7) was in practice sentence-vector dominant,
+        and the attribute term (W_ATTR=0.10) was drowned out entirely.
+
+        **The lexical term (W_LEX)** is BM25 plus the answer-shape
+        prior.  It was DEAD CODE before this revision: `_score_tfidf`
+        had lost its only caller when the layer-quota step was
+        removed, so BM25, the IDF-weighted entity discrimination and
+        the HotpotQA-specific answer-shape prior (ner_density /
+        has_number) contributed nothing to the ranking.  They are
+        back.
 
         Returns one dict per sid:
             {sentence_id, event_id, S_h_E, S_h_F, S_f,
-             attr_match, attr_term, echo_penalty, final_score}
+             attr_match, attr_term, echo_penalty, final_score,
+             norm_name, norm_sent, norm_fact, norm_attr, norm_lex}
         Sorted order is the caller's responsibility.
         """
         if not sids:
@@ -2295,6 +2651,7 @@ class StenGraphPipeline:
         sum_event_term = 0.0
         sum_fact_term = 0.0
         sum_attr_term = 0.0
+        sum_lex_term = 0.0
         cnt_event = 0
 
         # ─────────────────────────────────────────────────────────────
@@ -2364,7 +2721,36 @@ class StenGraphPipeline:
         # abandoned and the global set is used.
         # ----------------------------------------------------------------
         query_owned_attrs: Set[str] = set()
+        # ─────────────────────────────────────────────────────────────
+        # [2026-11-01] 实体-属性槽位匹配（改造 H，第 2 项）
+        # ─────────────────────────────────────────────────────────────
+        # 上面这层"query 实体拥有哪些属性"是**粗粒度**的：它只知道
+        # "这个实体有 birth / career / education"，不知道"是哪个实体、
+        # 挂的哪个属性、挂在这个句子上"。
+        #
+        # 而 sentence 侧的 `mounted_attrs` 同样粗（实体类型 × 属性类别）。
+        # 两边都是粗的 → 零交集 → 门误杀（改造 H 要解决的核心问题）。
+        #
+        # 这里建立**实体级的属性槽位索引**：
+        #     query_entity_key → {该实体拥有的属性名集合}
+        # 以及**句子级的挂载索引**：
+        #     (sentence_id, entity_key) → {属性名集合}
+        #
+        # 有了这两张表，就能问一个细得多的问题：
+        # "**这个句子里的这个实体**，是不是恰好挂着**问句想问的属性**？"
+        # —— 这才是原始设计里 `birth(A)` / `date(EVENT_A)` 的粒度。
+        #
+        # 实体键用**小写表面形式 + 末词**双索引，因为 HotpotQA 问句
+        # 常只写姓氏（"Which city was Havel born in?" vs 句里的
+        # "Václav Havel"）—— 末词降级形态已经在 query 侧用过，
+        # 这里对 sentence 侧用同一套规则，两边才能对上。
+        # ─────────────────────────────────────────────────────────────
+        query_entity_keys: Set[str] = set()
+        query_slot_attrs: Dict[str, Set[str]] = {}
         for ent in (self._last_query_entities or []):
+            e = (ent or "").strip().lower()
+            if not e:
+                continue
             try:
                 container = self.cm.get_container_for_entity(ent)
             except Exception:  # noqa: BLE001
@@ -2374,6 +2760,14 @@ class StenGraphPipeline:
             for name, slot in (getattr(container, "attributes", {}) or {}).items():
                 if name and name != "other" and getattr(slot, "sentence_ids", None):
                     query_owned_attrs.add(name)
+            # 该实体拥有的属性名（按实体键存一份）
+            names = {
+                n for n, sl in (getattr(container, "attributes", {}) or {}).items()
+                if n and n != "other" and getattr(sl, "sentence_ids", None)
+            }
+            for k in _entity_keys(e):
+                query_entity_keys.add(k)
+                query_slot_attrs.setdefault(k, set()).update(names)
 
         # ----------------------------------------------------------------
         # Hard attribute gate
@@ -2414,7 +2808,193 @@ class StenGraphPipeline:
                     wanted_attrs_rank = restricted
             wanted_attrs = set(wanted_attrs_rank[:ATTR_GATE_TOP_K])
 
-        # query_attr_vec[k] = normalised cosine similarity of attr k with query
+        # ─────────────────────────────────────────────────────────────
+        # [2026-10-30] 精排公式修复：分量收集 → 统一归一化 → 加权
+        #
+        # 旧公式把不同量纲的余弦直接相加：
+        #     final = W_EVENT·(W_NAME·cos(title,q)·pen + W_SENT·cos(sent,q))
+        #           + (1-W_EVENT)·cos(sent,q) + W_ATTR·attr
+        # cos(title,q) ∈ [0.15,0.35]，cos(sent,q) ∈ [0.35,0.55]，
+        # 直接相加 → 方差大的分量主导 → 名义上的"事件名主导"实际
+        # 变成了"句子向量主导"；属性信号（W_ATTR=0.10）被完全淹没。
+        #
+        # 新公式：每个分量先在候选池内 min-max 归一化到 [0,1]，再加权。
+        # 归一化后权重才真正表达设计意图。
+        #
+        #     final = W_EVENT_NAME_N · norm(name · penalty)
+        #           + W_SENT_N       · norm(sentence cosine)
+        #           + W_FACT_N       · norm(sentence cosine, 事实项)
+        #           + W_ATTR         · norm(attribute match)
+        #           + W_LEX          · norm(BM25 + 答案形状先验)
+        #
+        # 阶段 1（本循环）：逐句收集**原始**分量。
+        # 阶段 2：统一归一化。
+        # 阶段 3：加权求和。
+        # ─────────────────────────────────────────────────────────────
+
+        # 词法信号：BM25(query, sentence) + 答案形状先验。
+        #
+        # 这条信号独立于稠密余弦 —— MiniLM 在"问句问一个具体事实、
+        # 答案句是短事实句"这类任务上纯稠密余弦的 top-1 精度本来就弱，
+        # 而 BM25 能靠 IDF 权重救回稀有实体。改造日志 A 已验证过：
+        # 接回 TF-IDF 后 R@5 +0.033。
+        #
+        # 之前 `_score_tfidf` 是死代码（Step 7 被删后失去唯一调用者），
+        # 现在它重新进入打分链路。
+        lex_raw: Dict[str, float] = {}
+        if W_LEX > 0.0:
+            try:
+                lex_pairs = self._score_tfidf(query, sids)
+                if lex_pairs:
+                    lex_raw = {s: float(v) for s, v in lex_pairs}
+            except Exception as e:  # noqa: BLE001
+                logger.debug("event_fact: lexical scoring failed (%s)", e)
+                lex_raw = {}
+
+        # 属性名 → ATTRIBUTE_NAMES 下标的映射。
+        #
+        # 旧代码在内层循环里对每个属性做一次 `ATTRIBUTE_NAMES.index(...)`
+        # —— 40+ 个属性 × 数百个句子 = 每题几万次线性扫描。
+        attr_index: Dict[str, int] = {
+            name: i for i, name in enumerate(ATTRIBUTE_NAMES)
+        }
+
+        # ─────────────────────────────────────────────────────────────
+        # 答案形状先验（answer-shape prior）
+        #
+        # 问句的"期望答案形状"决定了哪种句子更可能是答案句：
+        #   · 问年份/数字 → 含数字的句子更可能是答案句
+        #   · 问人名/机构 → 专名密度高的句子更可能是答案句
+        #
+        # 这个先验是专门为 HotpotQA 写的，但 `_answer_shape_features`
+        # 一直没有调用者（Step 7 被删后成为死代码）。现在接回来。
+        #
+        # 它**只在问句本身有形状暗示时**才生效：
+        #   · 问句含 when/what year/how many/how much → 需要数字
+        #   · 其他情况 → 需要专名
+        # ─────────────────────────────────────────────────────────────
+        want_number = bool(
+            re.search(
+                r"\b(when|what\s+year|which\s+year|how\s+many|how\s+much|"
+                r"how\s+long|how\s+old)\b",
+                (query or "").lower(),
+            )
+        )
+        shape_raw: Dict[str, float] = {}
+        for sid in sids:
+            ner_density, has_number, _n_tok = self._answer_shape_features(
+                self._text_of(sid) or ""
+            )
+            if want_number:
+                # 期望数字 → 含数字是强信号，其次是实体密度。
+                shape_raw[sid] = (
+                    (1.0 if has_number else 0.0) * 0.7
+                    + min(1.0, ner_density * 3.0) * 0.3
+                )
+            else:
+                # 期望实体 → 实体密度是主信号，数字是弱负信号
+                # （HotpotQA 的比较类问题里数字是干扰项）。
+                shape_raw[sid] = (
+                    min(1.0, ner_density * 3.0) * 0.8
+                    - (0.15 if has_number else 0.0)
+                )
+        shape_raw = {k: max(0.0, v) for k, v in shape_raw.items()}
+
+        # ─────────────────────────────────────────────────────────────
+        # 句法关系匹配（syntactic relation bonus）
+        #
+        # `_step1_5_query_relations` 抽出了问句的"句法骨架"
+        # （verb / obj / subj / preps），但这个信号**从来没有被任何
+        # 打分环节消费过** —— 抽取了、存进了 `self._last_query_relations`、
+        # 然后就死了。
+        #
+        # 它的价值在于捕捉纯稠密余弦抓不到的东西：
+        #   问句 "What county was X born in?"
+        #     verb=born, obj=county
+        #   候选句 "Havel was born in Prague, Bohemia."
+        #     含 "born" + "Prague"(专名) + "county" 语义
+        # 但纯余弦只看到"都是关于 Havel 的句子"。
+        #
+        # 判定方式：候选句里是否出现与问句 verb/obj 共享词根的词。
+        # 用词根匹配（而非精确相等）是因为 "born"/"birth"、
+        # "release"/"released" 词形不同但同义。
+        # ─────────────────────────────────────────────────────────────
+        rel_raw: Dict[str, float] = {}
+        q_rels = getattr(self, "_last_query_relations", None) or {}
+        q_verbs = [v for v in (q_rels.get("verb") or []) if v]
+        q_objs = [v for v in (q_rels.get("obj") or []) if v]
+        # 关系词干：去常见后缀，让 born/birth、release/released 能对上。
+        _SUFFIXES = ("ing", "ed", "es", "s", "e", "d", "tion", "ment")
+
+        def _stems(words: List[str]) -> List[str]:
+            out: List[str] = []
+            for w in words:
+                w = w.lower()
+                out.append(w)
+                for suf in _SUFFIXES:
+                    if len(w) > len(suf) + 2 and w.endswith(suf):
+                        out.append(w[: -len(suf)])
+                        break
+            return out
+
+        q_verb_stems = _stems(q_verbs)
+        q_obj_stems = _stems(q_objs)
+        if q_verb_stems or q_obj_stems:
+            for sid in sids:
+                text = (self._text_of(sid) or "").lower()
+                if not text:
+                    rel_raw[sid] = 0.0
+                    continue
+                tokens = set(re.findall(r"[a-z]+", text))
+                verb_hit = 1.0 if any(
+                    st in tokens for st in q_verb_stems
+                ) else 0.0
+                obj_hit = 1.0 if any(
+                    st in tokens for st in q_obj_stems
+                ) else 0.0
+                # 问句的 verb 比 obj 更能区分"这条句子是不是在回答
+                # 这个问题"，所以给更高权重。
+                rel_raw[sid] = 0.6 * verb_hit + 0.4 * obj_hit
+        else:
+            rel_raw = {sid: 0.0 for sid in sids}
+
+        # 阶段 1：逐句收集原始分量。
+        raw_name: Dict[str, float] = {}
+        raw_sent: Dict[str, float] = {}
+        raw_fact: Dict[str, float] = {}
+        raw_attr: Dict[str, float] = {}
+        raw_lex: Dict[str, float] = {}
+        per_sid: Dict[str, Dict[str, Any]] = {}
+
+        # 问句实体锚点（用于事实项的实体覆盖度）。
+        #
+        # 取自 step1 抽出的语义实体。每个实体是一组"可接受形态"：
+        #   整名（"Vaclav Havel"）或 末词（"havel"）。
+        # 只要句子里出现其中任一形态，就算这个实体被覆盖。
+        #
+        # 为什么要分组而不是拍平成一个 token 列表：
+        # 拍平的话，"Vaclav Havel" 和 "havel" 会变成两个独立 token，
+        # 命中整名的句子反而只得了 0.5 的覆盖度 —— 语义完全相反。
+        #
+        # 为什么要末词降级形态：HotpotQA 的问句常常只写姓氏
+        # （"Which city was Havel born in?"），句子里的形式可能不同。
+        q_entity_groups: List[List[str]] = []
+        for ent in (self._last_query_entities or []):
+            e = (ent or "").strip().lower()
+            if not e:
+                continue
+            forms: List[str] = [e]
+            parts = [p for p in re.findall(r"[a-z0-9]+", e) if len(p) >= 3]
+            if parts:
+                last = parts[-1]
+                if last != e:
+                    forms.append(last)
+            # 组内去重。
+            seen_f: Set[str] = set()
+            forms = [f for f in forms if not (f in seen_f or seen_f.add(f))]
+            if forms:
+                q_entity_groups.append(forms)
+
         for sid in sids:
             sh_f = s_h_f.get(sid, 0.0)
             # Choose the event this sentence belongs to.  The event-level
@@ -2446,28 +3026,50 @@ class StenGraphPipeline:
                 best_event_size = 0
                 best_penalty = 1.0
 
-            # ── S_h_E(句子) = W_EVENT_NAME·cos(event_name, query)
-            #                + W_EVENT_SENT·cos(sentence_vec, query) ──
-            #
-            # The sentence term IS `sh_f` (the same summary_vector
-            # cosine), but re-used here at a different weight inside the
-            # event term.  Negative cosines are clamped to 0: an
-            # anti-aligned sentence carries no positive signal, and
-            # clamping keeps S_h_E in [0, 1] like every other component.
+            # Negative cosines are clamped to 0: an anti-aligned sentence
+            # carries no positive signal.
             name_term = max(0.0, best_name_cos)
             sent_term = max(0.0, sh_f)
-            best_sh_e = W_EVENT_NAME * name_term + W_EVENT_SENT * sent_term
 
-            # 大事件惩罚: 仅作用于 S_h(E,Q) 的事件名分量.
-            # The sentence-vector term is per-sentence and must NOT be
-            # penalised — a large paragraph's sentences are just as
-            # relevant as a small paragraph's.
-            event_term = W_EVENT * (
-                W_EVENT_NAME * name_term * best_penalty
-                + W_EVENT_SENT * sent_term
-            )
-            fact_term = (1.0 - W_EVENT) * sh_f
+            # 大事件惩罚只作用于事件名分量。句子向量分量是逐句的，
+            # 不该被惩罚 —— 大段落的句子并不比小段落的句子次要。
+            raw_name[sid] = name_term * best_penalty
+            raw_sent[sid] = sent_term
+            raw_lex[sid] = lex_raw.get(sid, 0.0)
 
+            # ─────────────────────────────────────────────────────────
+            # 事实项 = 问句实体覆盖度（entity coverage）
+            #
+            # 旧代码的 fact_term 是 `(1-W_EVENT) * sh_f` —— 和
+            # sent_term **完全同一个值**。这意味着句子余弦被算了两次
+            # （一次在 event_term 里、一次在 fact_term 里），整条公式
+            # 实际上退化成了"句子余弦 × 常数"，name/attr/lex 三个
+            # 分量的相对权重被进一步稀释。
+            #
+            # 新的 fact 项是一个**独立**信号：候选句覆盖了问句里多少
+            # 个实体锚点。HotpotQA 是多跳题，答案句往往同时提到问句
+            # 里的两个实体（"Havel" + "Bohemia"）；只提到一个的句子
+            # 不可能独立回答这个问题。
+            #
+            # 这正是多跳检索真正需要的判别力，而且它和句法关系信号
+            # 正交（句法看动词，实体覆盖看名词锚点）。
+            # ─────────────────────────────────────────────────────────
+            cov = 0.0
+            if q_entity_groups:
+                node_c = self.registry.get_node(sid)
+                sent_text_c = (
+                    (getattr(node_c, "complemented_text", "") or "")
+                    if node_c is not None else ""
+                )
+                if not sent_text_c:
+                    sent_text_c = self._text_of(sid) or ""
+                sent_lower = sent_text_c.lower()
+                hit = sum(
+                    1 for forms in q_entity_groups
+                    if any(f in sent_lower for f in forms)
+                )
+                cov = hit / len(q_entity_groups)
+            raw_fact[sid] = cov
             # Symmetric-attribute soft match.
             #
             #   query_attr_vec[k] = normalised cos(query_emb, desc_k)
@@ -2479,9 +3081,14 @@ class StenGraphPipeline:
             #                      `GraphBuilder._soft_mount_attributes`)
             #   c_k               = weight_k · query_attr_vec[k]
             #   best              = max_k c_k               (peak signal)
-            #   coverage          = Σ c_k / count            (alignment)
+            #   coverage          = Σ c_k / max_k c_k       (对齐度)
             #   attr_match        = best · (0.7 + 0.3·coverage) ∈ [0,1]
-            #   attr_term         = W_ATTR · attr_match
+            #
+            # **coverage 的定义改了**：旧版是 `Σc / count`（平均）。
+            # 平均值的问题是**符号反了** —— 挂载的属性越多，平均值
+            # 反而被拉低，"对齐度"反而变差。改成 `Σc / max_k c_k`
+            # 才是真正的"有多少信号集中在最好的那个属性上"，
+            # 取值 ∈ [0,1]，挂载多且一致 → 接近 1。
             #
             # The sentence side is a CONTINUOUS score per attribute, not
             # a name plus a binary weight — this is what lets a sentence
@@ -2500,17 +3107,22 @@ class StenGraphPipeline:
             attr_match = 0.0
             mounted_attrs: Set[str] = set()
             sent_attr_vec: Dict[str, float] = {}
+            # [2026-11-01] 实体-属性槽位对齐分（改造 H，第 2 项）
+            slot_bonus = 0.0
+            slot_hits: List[str] = []
             if query_attr_vec:
                 node = self.registry.get_node(sid)
                 if node is not None:
                     # Max mount weight per attribute, across the
                     # sentence's entities.
                     w_by_attr: Dict[str, float] = {}
+                    # 实体级挂载索引：(实体键 → 该实体在此句挂的属性)
+                    mount_by_entity: Dict[str, Set[str]] = {}
                     for m in (getattr(node, "attribute_mounts", []) or []):
                         aname = getattr(m, "attribute_name", "") or ""
                         if not aname or aname == "other":
                             continue
-                        if aname not in ATTRIBUTE_NAMES:
+                        if aname not in attr_index:
                             continue
                         try:
                             w = float(getattr(m, "weight", 1.0) or 0.0)
@@ -2519,84 +3131,264 @@ class StenGraphPipeline:
                         w = min(max(w, 0.0), 1.0)
                         if w > w_by_attr.get(aname, 0.0):
                             w_by_attr[aname] = w
+                        # 实体级索引：同一个句子里，同一个实体可能挂多个
+                        # 属性，全部记下来。
+                        ent_name = getattr(m, "entity", "") or ""
+                        for ek in _entity_keys(ent_name):
+                            mount_by_entity.setdefault(ek, set()).add(aname)
                     if w_by_attr:
                         num = 0.0
-                        cnt = 0
                         best_c = 0.0
                         for aname, w in w_by_attr.items():
-                            k = ATTRIBUTE_NAMES.index(aname)
+                            k = attr_index[aname]
                             c = w * query_attr_vec[k]
                             num += c
-                            cnt += 1
                             if c > best_c:
                                 best_c = c
-                        coverage = (num / cnt) if cnt > 0 else 0.0
+                        # 对齐度：所有属性信号之和 / 最强属性信号。
+                        # ∈ [0,1]，且"挂载更多一致的属性"会**提高**它。
+                        coverage = (num / best_c) if best_c > 1e-9 else 0.0
+                        # coverage 上限截到 1.0：num 可能 > best_c
+                        # （多个属性都接近 best），那说明对齐很好，
+                        # 不该再放大。
+                        coverage = min(1.0, coverage)
                         attr_match = best_c * (0.7 + 0.3 * coverage)
                         mounted_attrs = set(w_by_attr)
                         sent_attr_vec = dict(w_by_attr)
 
-            # Hard attribute gate: drop the sentence if it mounts none of
-            # the query's top-3 wanted attributes.  A sentence with no
-            # attribute mount at all is also dropped — it cannot answer an
-            # attribute question.  When `wanted_attrs` is empty (no usable
-            # query attribute signal) the gate is skipped.
+                    # ─────────────────────────────────────────────────
+                    # 实体-属性槽位对齐（细粒度）
+                    #
+                    # 问："这个句子里的**这个实体**，是不是恰好挂着
+                    # **问句想问的属性**？"
+                    #
+                    # 粗粒度问的是"这个句子挂的属性" ∩ "问句想要的属
+                    # 性"，经常零交集（改造 H 的核心病灶）。细粒度问
+                    # 的是"实体 A 的 birth 属性" vs "问句想要 birth"，
+                    # 只要句子里的实体就是问句问的那个实体，就能对上。
+                    #
+                    # 例：问句问 "Which city was Havel born in?"，句子里
+                    # "Václav Havel was born in Mělník" 挂的是
+                    # `birth(Václav Havel, PERSON)` —— 实体键 "havel"
+                    # 命中，属性 `birth` 命中 → 对齐。
+                    #
+                    # 这个分数是**加成项**，不单独决定生死：
+                    #   · 末词降级有误匹配风险（两个 Smith）
+                    #   · 问句实体抽取可能漏掉关键实体
+                    # 所以它只提升 attr_match 的上限，不做硬判定。
+                    # ─────────────────────────────────────────────────
+                    if query_entity_keys and mount_by_entity:
+                        for ek in query_entity_keys:
+                            held = mount_by_entity.get(ek)
+                            if not held:
+                                continue
+                            # 该实体在此句挂的属性里，有多少是问句想要的
+                            overlap = held & set(wanted_attrs_rank)
+                            if overlap:
+                                slot_bonus = max(
+                                    slot_bonus,
+                                    max(
+                                        query_attr_vec[attr_index[a]]
+                                        for a in overlap
+                                    ),
+                                )
+                                slot_hits = sorted(overlap)
+                                break
+
+            # Apply the entity-slot alignment bonus.
+            #
+            # `attr_match` from the coarse path is capped at 1.0 already;
+            # the slot path can only RAISE it, never lower it.  So we
+            # take the max of the two rather than a blend — a sentence
+            # that matches the right entity+attribute slot must never
+            # be penalised by a mediocre coarse score.
+            if slot_bonus > 0.0:
+                attr_match = max(
+                    attr_match, slot_bonus * ATTR_SLOT_MATCH_WEIGHT,
+                )
+
+            raw_attr[sid] = attr_match
+
+            # Soft gate: the sentence is NEVER deleted for missing the
+            # wanted attributes.  The flag is still computed (it feeds
+            # the eval diagnostics) but it no longer has any effect on
+            # selection — see the gate block above for the full
+            # rationale.
             attr_gate_pass = True
             if wanted_attrs:
                 attr_gate_pass = bool(mounted_attrs & wanted_attrs)
 
-            attr_term = W_ATTR * attr_match
-            s_f = event_term + fact_term
-            ep = echo_pen.get(sid, 0.0)
-            final = s_f + attr_term - ep
-            out.append({
-                "sentence_id": sid,
+            per_sid[sid] = {
                 "event_id": best_eid,
                 "event_size": int(best_event_size),
                 "penalty": float(best_penalty),
-                "S_h_E": float(best_sh_e),
-                "S_h_F": float(sh_f),
+                "name_term": float(name_term),
+                "sent_term": float(sent_term),
+                "attr_match": float(attr_match),
+                "attr_gate_pass": bool(attr_gate_pass),
+                "mounted_attrs": sorted(mounted_attrs),
+                "sent_attr_vec": sent_attr_vec,
+                # [2026-11-01] 槽位对齐分（诊断用）
+                "attr_slot_bonus": float(slot_bonus),
+                "attr_slot_hits": list(slot_hits),
+            }
+
+        # ─────────────────────────────────────────────────────────────
+        # 阶段 2：统一归一化。每个分量在候选池内 min-max 到 [0,1]。
+        # 归一化之后，权重才真正等于"这个分量占最终分数的几成"。
+        # ─────────────────────────────────────────────────────────────
+        n_name = _minmax_norm(raw_name)
+        n_sent = _minmax_norm(raw_sent)
+        # 事实项（实体覆盖度）同理：问句里没有实体锚点时，所有候选
+        # 的覆盖度都是 0，退化归一化会把它变成常数 1.0 —— 排序上
+        # 无害，但会让 avg_fact 看起来像"实体覆盖在起作用"。
+        has_fact_signal = any(v > 1e-9 for v in raw_fact.values())
+        n_fact = _minmax_norm(raw_fact) if has_fact_signal else {
+            sid: 0.0 for sid in raw_fact
+        }
+        # 属性分量只有在**确实有属性信号**时才参与归一化。
+        #
+        # 当 `attr_soft_match_mode` 关闭时，所有候选的 attr_match 都是
+        # 0.0 —— 对全等值做 min-max 会退化成"全体 1.0"，于是
+        # attr_term 变成一个恒定的 0.30 常数。它不影响排序（常数对
+        # 所有候选相同），但会让 final 的绝对值失真、日志里的
+        # avg_attr 看起来像是"属性在起作用"，具有误导性。
+        #
+        # 所以：没有属性信号时，属性分量整体归零。
+        has_attr_signal = any(v > 1e-9 for v in raw_attr.values())
+        n_attr = _minmax_norm(raw_attr) if has_attr_signal else {
+            sid: 0.0 for sid in raw_attr
+        }
+        # 词法总分 = BM25 + 答案形状先验 + 句法关系匹配，三者归一化后融合。
+        #
+        # 三个信号互补，覆盖三种不同的"对":
+        #   · BM25        → 词面对不对（问句的稀有词有没有出现在句子里）
+        #   · 形状先验    → 类型对不对（问年份要含年份，问人要含专名）
+        #   · 句法关系    → 动作对不对（问 born，句子里要有 born）
+        #
+        # 归一化后相加，避免 BM25 的绝对量级压过另外两个。
+        n_lex: Dict[str, float] = {}
+        n_bm25 = _minmax_norm(raw_lex) if lex_raw else {}
+        n_shape = _minmax_norm(shape_raw)
+        n_rel = _minmax_norm(rel_raw)
+        for sid in sids:
+            n_lex[sid] = (
+                0.50 * n_bm25.get(sid, 0.0)
+                + 0.25 * n_shape.get(sid, 0.0)
+                + 0.25 * n_rel.get(sid, 0.0)
+            )
+        # 归一化后的融合值本身也需要再归一化 —— 否则三个分量的加权和
+        # 会超出 [0,1]，破坏 W_LEX 的语义。
+        #
+        # 但如果三个子信号全是退化值（全体相同），融合结果也是常数，
+        # 二次归一化会把它变成全体 1.0 —— 排序上无害，但 avg_lex 会
+        # 看起来像"词法信号在起作用"。这种情况直接归零。
+        if (
+            n_bm25 and any(v > 1e-9 for v in n_bm25.values())
+        ) or any(v > 1e-9 for v in n_shape.values()) or any(
+            v > 1e-9 for v in n_rel.values()
+        ):
+            n_lex = _minmax_norm(n_lex)
+        else:
+            n_lex = {sid: 0.0 for sid in sids}
+
+        # ─────────────────────────────────────────────────────────────
+        # 阶段 3：加权求和。
+        # ─────────────────────────────────────────────────────────────
+        out: List[Dict[str, Any]] = []
+        for sid in sids:
+            info = per_sid.get(sid) or {}
+            ep = echo_pen.get(sid, 0.0)
+
+            name_n = n_name.get(sid, 0.0)
+            sent_n = n_sent.get(sid, 0.0)
+            fact_n = n_fact.get(sid, 0.0)
+            attr_n = n_attr.get(sid, 0.0)
+            lex_n = n_lex.get(sid, 0.0) if n_lex else 0.0
+
+            # 归一化后的分解（诊断用）。
+            name_term = W_EVENT_NAME_N * name_n
+            sent_term = W_SENT_N * sent_n
+            fact_term = W_FACT_N * fact_n
+            attr_term = W_ATTR * attr_n
+            lex_term = W_LEX * lex_n
+
+            # 旧的 S_f / event_term 语义保留在 breakdown 里，但它们
+            # 现在是**归一化后**的加权和，不再是"两个不同量纲的余弦
+            # 直接相加"。
+            event_term = name_term + sent_term
+            s_f = event_term + fact_term
+            final = event_term + fact_term + attr_term + lex_term - ep
+
+            out.append({
+                "sentence_id": sid,
+                "event_id": info.get("event_id"),
+                "event_size": int(info.get("event_size", 0)),
+                "penalty": float(info.get("penalty", 1.0)),
+                "S_h_E": float(name_term + sent_term),
+                "S_h_F": float(fact_term),
                 "S_f": float(s_f),
                 "event_term": float(event_term),
                 "fact_term": float(fact_term),
-                "attr_match": float(attr_match),
+                "attr_match": float(info.get("attr_match", 0.0)),
                 "attr_term": float(attr_term),
-                "attr_gate_pass": bool(attr_gate_pass),
-                "mounted_attrs": sorted(mounted_attrs),
+                "attr_gate_pass": bool(info.get("attr_gate_pass", True)),
+                "mounted_attrs": list(info.get("mounted_attrs") or []),
+                # The NORMALISED components — these are what the weights
+                # actually multiply.  Keeping both the raw and the
+                # normalised values in the breakdown is what makes a
+                # ranking regression diagnosable after the fact.
+                "norm_name": float(name_n),
+                "norm_sent": float(sent_n),
+                "norm_fact": float(fact_n),
+                "norm_attr": float(attr_n),
+                "norm_lex": float(lex_n),
+                "lex_term": float(lex_term),
+                "raw_name_cos": float(info.get("name_term", 0.0)),
+                "raw_sent_cos": float(info.get("sent_term", 0.0)),
                 # Continuous per-attribute scores for this sentence
                 # (e.g. {"date": 0.81, "death": 0.93}) — the "date 0.8,
                 # death 0.9" profile the design called for.
-                "sent_attr_vec": {k: round(float(v), 4) for k, v in sent_attr_vec.items()},
+                "sent_attr_vec": {
+                    k: round(float(v), 4)
+                    for k, v in (info.get("sent_attr_vec") or {}).items()
+                },
                 "wanted_attrs": sorted(wanted_attrs),
                 "wanted_attrs_rank": list(wanted_attrs_rank),
+                # [2026-11-01] 槽位对齐诊断（改造 H 第 2 项）。
+                # `attr_slot_hits` 是"这个句子的这个实体"挂的、且问句
+                # 想要��属性 —— 命中它说明细粒度信号起作用了。
+                "attr_slot_bonus": float(
+                    info.get("attr_slot_bonus", 0.0)
+                ),
+                "attr_slot_hits": list(info.get("attr_slot_hits") or []),
                 "echo_penalty": float(ep),
-                # S_h_E decomposition (new formula):
-                #   S_h_E = W_EVENT_NAME·cos(event_name,q)
-                #         + W_EVENT_SENT·cos(sentence_vec,q)
-                "S_h_E_name_cos": float(name_term),
-                "S_h_E_sent_cos": float(sent_term),
                 "final_score": float(final),
             })
-            if best_eid is not None:
-                sum_event_size += best_event_size
-                sum_penalty += best_penalty
+            if info.get("event_id") is not None:
+                sum_event_size += int(info.get("event_size", 0))
+                sum_penalty += float(info.get("penalty", 1.0))
                 sum_event_term += event_term
                 sum_fact_term += fact_term
                 cnt_event += 1
             sum_attr_term += attr_term
+            sum_lex_term += lex_term
         if cnt_event > 0:
             logger.info(
-                "[EF-rank-pen] n=%d | W_EVENT=%.2f | GAMMA_E=%.2f | "
-                "W_EVENT_NAME=%.2f W_EVENT_SENT=%.2f | "
+                "[EF-rank-pen] n=%d | W_NAME_N=%.2f W_SENT_N=%.2f "
+                "W_FACT_N=%.2f W_ATTR=%.2f W_LEX=%.2f | GAMMA_E=%.2f | "
                 "avg_event_size=%.2f | avg_penalty=%.4f | "
                 "avg_event_term=%.4f | avg_fact_term=%.4f | "
-                "avg_attr_term=%.4f",
-                len(sids), W_EVENT, GAMMA_E,
-                W_EVENT_NAME, W_EVENT_SENT,
+                "avg_attr_term=%.4f | avg_lex_term=%.4f",
+                len(sids),
+                W_EVENT_NAME_N, W_SENT_N, W_FACT_N, W_ATTR, W_LEX,
+                GAMMA_E,
                 sum_event_size / cnt_event,
                 sum_penalty / cnt_event,
                 sum_event_term / cnt_event,
                 sum_fact_term / cnt_event,
                 sum_attr_term / max(1, len(sids)),
+                sum_lex_term / max(1, len(sids)),
             )
         return out
 

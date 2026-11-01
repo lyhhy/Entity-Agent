@@ -38,7 +38,14 @@ Concretely, per run the agent:
      ("birth" belongs to PERSON, "date" belongs to EVENT); if it would
      rank equally high for several classes it discriminates nothing
      and is discarded.
-5. **Applies** the surviving delta through `AttributeSchema`, then
+5. **Prunes** the table: the entries whose mount efficiency has
+   collapsed are DROPPED, not merely rejected on arrival.  The rule is
+   "如果这个属性后面挂载句子效率低就丢弃这个属性或者类" — without this
+   pass the table could only ever grow, and a stale attribute kept
+   occupying a slot in the attribute embedding matrix would keep
+   costing recall.  The prune pass uses the SAME measurement as the
+   acceptance gate, so what the agent proposes it also audits.
+6. **Applies** the surviving delta through `AttributeSchema`, then
    re-mounts the sentences so the new attributes actually take effect.
 
 The LLM is used in exactly two places, and both are fallbacks:
@@ -247,11 +254,36 @@ class AttributeAgentConfig:
                           rejected.
         max_llm_calls:    Hard cap on LLM calls per run.
         use_llm:          Whether the LLM fallback may be used at all.
+        prune:            Whether the PRUNE pass runs.  The prune pass
+                          drops table entries whose mount efficiency
+                          collapsed — "如果这个属性后面挂载句子效率低就丢弃
+                          这个属性或者类".  With it off the table can
+                          only ever grow.
+        prune_scope:      What the prune pass may touch.
+
+                          * "delta" (default) — only the attributes and
+                            classes THE AGENT ADDED (i.e. the entries in
+                            the schema delta).  Safe: a hand-designed
+                            base entry is never deleted by a run that
+                            did not create it.
+                          * "all" — every attribute / class in the table,
+                            including the hand-designed base ones.  Use
+                            this to let the agent prune the base table
+                            as well; it is destructive by design.
     """
 
     n_questions: int = 20
     n_rounds: int = 10
-    seed: int = 1234
+    # Base seed.  `None` means "draw a fresh random seed for this run",
+    # which is the DEFAULT: the agent is supposed to explore the table
+    # from different angles on every run, so a hard-coded seed would
+    # make every run propose the same delta and hide the fact that the
+    # result is unstable.
+    #
+    # The effective seed is recorded on the report (`AgentReport.seed`)
+    # so a run stays reproducible — you can re-run it by passing that
+    # number back in.
+    seed: Optional[int] = None
 
     min_mount_count: int = 3
     min_global_mount_rate: float = 0.02
@@ -261,6 +293,10 @@ class AttributeAgentConfig:
 
     max_llm_calls: int = 200
     use_llm: bool = True
+
+    # -- prune ----------------------------------------------------------
+    prune: bool = True
+    prune_scope: str = "delta"
 
     # Attribute mounting constants inherited from the graph builder.
     top_k: int = _sg.ATTR_MOUNT_TOP_K
@@ -319,9 +355,20 @@ class AgentReport:
 
     n_sampled: int = 0
     n_rounds: int = 0
+    # The seed that was actually used.  When `config.seed` is None a
+    # fresh one is drawn per run; recording it keeps the run
+    # reproducible without pinning the default.
+    seed: Optional[int] = None
     gaps: List[AttributeGap] = field(default_factory=list)
     accepted: List[AttributeGap] = field(default_factory=list)
     rejected: List[AttributeGap] = field(default_factory=list)
+    # Gaps the PRUNE pass dropped: table attributes / classes whose
+    # mount efficiency collapsed below the gate.  They are reported
+    # separately from `rejected`, because a rejected gap was never in
+    # the table while a pruned entry WAS in it and has now been removed.
+    pruned: List[AttributeGap] = field(default_factory=list)
+    removed_attributes: List[str] = field(default_factory=list)
+    removed_classes: List[str] = field(default_factory=list)
     llm_calls: int = 0
     ambiguity_resolved: int = 0
     schema: Optional[AttributeSchema] = None
@@ -331,9 +378,15 @@ class AgentReport:
         return {
             "n_sampled": self.n_sampled,
             "n_rounds": self.n_rounds,
+            "seed": self.seed,
             "n_gaps": len(self.gaps),
             "n_accepted": len(self.accepted),
             "n_rejected": len(self.rejected),
+            "n_pruned": len(self.pruned),
+            "n_removed_attributes": len(self.removed_attributes),
+            "n_removed_classes": len(self.removed_classes),
+            "removed_attributes": list(self.removed_attributes),
+            "removed_classes": list(self.removed_classes),
             "llm_calls": self.llm_calls,
             "ambiguity_resolved": self.ambiguity_resolved,
             "gaps": [g.to_dict() for g in self.gaps],
@@ -436,6 +489,19 @@ class AttributeAgent:
         self.schema = schema or AttributeSchema()
         self._llm_calls = 0
         self.progress = progress
+
+        # Resolve the seed.
+        #
+        # `config.seed is None` means "draw a fresh random seed for this
+        # run".  The agent's job is to explore the attribute table from
+        # several angles; pinning the seed to a constant would make every
+        # run propose the same delta and hide the fact that the result is
+        # unstable.  The resolved value is reported so the run can be
+        # reproduced by passing it back in.
+        if self.config.seed is None:
+            self.seed = random.SystemRandom().randrange(0, 2 ** 31)
+        else:
+            self.seed = int(self.config.seed)
 
         # Cache for the descriptor embeddings.
         #
@@ -579,16 +645,19 @@ class AttributeAgent:
         Draw ``n_rounds`` rounds of ``n_questions`` random questions.
 
         Each round uses its own derived seed, so the rounds are
-        reproducible from ``config.seed`` but not identical to each
+        reproducible from the run's seed but not identical to each
         other — that is what makes the agent see the table from several
         angles instead of re-checking the same 20 questions 10 times.
+
+        The seed used is `self.seed`, which was resolved once in
+        `__init__` (a fresh random one when `config.seed` is None).
         """
         if not questions:
             return []
         rounds: List[List[Dict[str, Any]]] = []
         n = min(self.config.n_questions, len(questions))
         for r in range(self.config.n_rounds):
-            rng = random.Random(self.config.seed + r * 7919)
+            rng = random.Random(self.seed + r * 7919)
             idx = rng.sample(range(len(questions)), n)
             idx.sort()
             rounds.append([questions[i] for i in idx])
@@ -943,6 +1012,7 @@ class AttributeAgent:
         candidates: Dict[str, Dict[str, str]],
         class_additions: Dict[str, List[str]],
         prefer_classes: Optional[Dict[str, str]] = None,
+        schema: Optional[AttributeSchema] = None,
     ) -> Dict[str, Dict[str, float]]:
         """
         Measure every candidate attribute.
@@ -965,11 +1035,16 @@ class AttributeAgent:
             candidates:     attribute -> {"descriptor", "home",
                             "candidates"}.  "candidates" is the set of
                             classes allowed to own it; "home" is a hint.
-                            class_additions: class -> the attributes a new
-                            class adds.
+            class_additions: class -> the attributes a new class adds.
             prefer_classes: attribute -> the class the QUESTION anchored
                             on, used to break a tie between two equally
                             good owner classes.
+            schema:         The schema whose templates the measurement
+                            runs against.  Defaults to the live one.
+                            The prune pass passes a COPY, so the audit
+                            sees the table as it WILL be after the
+                            accepted proposals, without mutating
+                            anything.
 
         For each candidate we compute:
 
@@ -979,12 +1054,13 @@ class AttributeAgent:
         * ``top_rate[T]``   — share of class T's sentences on which the
           candidate wins a top-K slot.
         """
+        schema = schema if schema is not None else self.schema
         total = len(profiles) or 1
 
         # The templates each class WOULD have if the delta were applied.
         templates: Dict[str, Dict[str, str]] = {
             etype: dict(tmpl)
-            for etype, tmpl in self.schema.effective_templates().items()
+            for etype, tmpl in schema.effective_templates().items()
         }
         # A candidate attribute is mounted by its HOME class, so it has
         # to exist in that class's template for the ranking to see it.
@@ -1060,8 +1136,15 @@ class AttributeAgent:
                     if cand_score < self.config.min_sim:
                         continue
                     cand_score *= float(weights.get(attr, 1.0))
+                    # The candidate is ALREADY in `base` when the class
+                    # declares it (the template drives the ranking set).
+                    # Appending it again would put it in the list twice
+                    # and waste a top-K slot, which would under-count
+                    # the other attributes.  So the existing entry is
+                    # REPLACED, not appended.
                     merged = sorted(
-                        base + [(attr, cand_score)],
+                        [(a, s) for a, s in base if a != attr]
+                        + [(attr, cand_score)],
                         key=lambda kv: -kv[1],
                     )[: self.config.top_k]
                     if any(a == attr for a, _ in merged):
@@ -1129,6 +1212,9 @@ class AttributeAgent:
                     [descriptor]
                     + [d for d in _sg.ATTRIBUTE_DESCRIPTORS.values()],
                     normalize_embeddings=True,
+                    # See graph_builder._soft_mount_attributes: the
+                    # progress bar drowns out the agent's own line.
+                    show_progress_bar=False,
                 ),
                 dtype=_np.float32,
             )
@@ -1265,6 +1351,146 @@ class AttributeAgent:
         )
 
     # ------------------------------------------------------------------
+    # Prune — the deletion half of the rolling optimisation
+    # ------------------------------------------------------------------
+
+    def _prune_targets(self, schema: AttributeSchema) -> List[str]:
+        """
+        The table entries the prune pass is allowed to touch.
+
+        With ``prune_scope == "delta"`` (the default) only the entries
+        THE AGENT ADDED are eligible: a hand-designed base attribute
+        must not be deleted by a run that did not create it.  With
+        ``"all"`` every entry in the table is eligible.
+        """
+        templates = schema.effective_templates()
+        if self.config.prune_scope == "all":
+            names: Set[str] = set()
+            for tmpl in templates.values():
+                names.update(tmpl.keys())
+            return sorted(n for n in names if n and n != "other")
+
+        # "delta" — only what this agent's schema added.
+        delta_names: Set[str] = set(schema.attributes.keys())
+        for cspec in schema.classes.values():
+            for attr in cspec.attributes:
+                delta_names.add(attr.name)
+        # A delta attribute that is NOT declared by any template (its
+        # owner class was itself pruned) is still eligible.
+        return sorted(n for n in delta_names if n and n != "other")
+
+    def _prune(
+        self,
+        all_profiles: Dict[str, Dict[str, float]],
+        all_node_types: Dict[str, List[str]],
+        schema: Optional[AttributeSchema] = None,
+    ) -> Tuple[List[str], List[str], Dict[str, Dict[str, float]]]:
+        """
+        Drop the table entries whose mount efficiency collapsed.
+
+        The rule the agent is built around is "如果这个属性后面挂载句子
+        效率低就丢弃这个属性或者类" — an attribute (or a whole entity
+        class) that mounts too few sentences must be DISCARDED, not
+        merely rejected on arrival.  Without this pass the table could
+        only ever grow, and a stale attribute kept occupying a slot in
+        the attribute embedding matrix would keep costing recall.
+
+        The measurement is the SAME one used to accept new candidates
+        (`_measure`), so an attribute is pruned exactly when it would
+        have been rejected on arrival.  That symmetry is what makes the
+        rolling optimisation converge: what the agent proposes, it also
+        audits.
+
+        Args:
+            all_profiles:    sentence id -> {attribute: cosine}.
+            all_node_types:  sentence id -> the classes of its entities.
+            schema:          The schema to audit.  Defaults to the live
+                             one.  A dry run passes a COPY, so the audit
+                             does not mutate the live delta.
+
+        Returns:
+            (removed_attributes, removed_classes, metrics) where the
+            metrics map every candidate to its measurement, so the
+            caller can report why each entry was dropped.
+        """
+        schema = schema if schema is not None else self.schema
+        targets = self._prune_targets(schema)
+        if not targets:
+            return [], [], {}
+
+        # The candidates are the attributes under audit.  Their owner
+        # classes are the classes they are declared by — the prune pass
+        # must measure them in the SAME template they live in, not in a
+        # hypothetical one.
+        templates = schema.effective_templates()
+        owner_of: Dict[str, str] = {}
+        for etype, tmpl in templates.items():
+            for name in tmpl:
+                if name in targets and name not in owner_of:
+                    owner_of[name] = etype
+
+        candidates: Dict[str, Dict[str, str]] = {}
+        for name in targets:
+            desc = schema.descriptor_for(name)
+            if not desc:
+                continue
+            owner = owner_of.get(name, "")
+            candidates[name] = {
+                "descriptor": desc,
+                "home": owner,
+                # The prune pass is NOT trying to re-assign ownership:
+                # every class that declares the attribute is a rival,
+                # because the point is only whether the attribute
+                # mounts enough at all.
+                "candidates": ",".join(
+                    t for t, tmpl in templates.items() if name in tmpl
+                ) or owner,
+            }
+
+        metrics = self._measure(
+            all_profiles, all_node_types, candidates, {},
+            prefer_classes={},
+            schema=schema,
+        )
+
+        removed_attrs: List[str] = []
+        removed_classes: List[str] = []
+        for name in sorted(candidates.keys()):
+            m = metrics.get(name) or {}
+            count = float(m.get("mount_count", 0.0))
+            rate = float(m.get("global_rate", 0.0))
+            if count >= self.config.min_mount_count and \
+                    rate >= self.config.min_global_mount_rate:
+                continue
+            removed_attrs.append(name)
+
+        # A class whose EVERY attribute has been pruned is a class that
+        # mounts nothing — it must go too, otherwise it would keep
+        # occupying a template slot and every sentence of that class
+        # would fall back to `description`.
+        #
+        # Only the slots that were MEASURED count: a slot that was not
+        # measured (no descriptor) is not evidence that the class is
+        # dead, so it blocks the class-level removal.  That is the
+        # conservative direction — a wrongly kept class costs one
+        # template slot, a wrongly dropped class sends every one of its
+        # sentences to the `description` catch-all.
+        for etype, tmpl in templates.items():
+            if etype in schema.removed_classes:
+                continue
+            slots = [n for n in tmpl if n and n != "other"]
+            if not slots:
+                continue
+            if not all(n in removed_attrs for n in slots):
+                continue
+            # With scope "delta" only the classes THE AGENT added may
+            # be dropped — a hand-designed base class stays.
+            if self.config.prune_scope == "all" or etype in schema.classes:
+                removed_classes.append(etype)
+
+        return removed_attrs, removed_classes, metrics
+
+    # ------------------------------------------------------------------
     # Ambiguity resolution
     # ------------------------------------------------------------------
 
@@ -1395,7 +1621,7 @@ class AttributeAgent:
             apply:    Whether to apply the accepted delta to the live
                       tables.  Set False for a dry run.
         """
-        report = AgentReport(n_rounds=self.config.n_rounds)
+        report = AgentReport(n_rounds=self.config.n_rounds, seed=self.seed)
         rounds = self.sample_rounds(questions)
         if not rounds:
             logger.warning("AttributeAgent: no questions to sample from.")
@@ -1410,6 +1636,10 @@ class AttributeAgent:
         all_profiles: Dict[str, Dict[str, float]] = {}
         all_node_types: Dict[str, List[str]] = {}
         last_builder = None
+
+        # Show the seed on the progress line — the user needs it to
+        # reproduce this exact run.
+        self._set_progress_extra(seed=self.seed)
 
         for rnd in rounds:
             for qdata in rnd:
@@ -1672,17 +1902,140 @@ class AttributeAgent:
                 classes=len(self.schema.classes),
             )
 
-        # --- pass 5: apply -------------------------------------------
-        if apply:
+        # --- pass 5: prune --------------------------------------------
+        #
+        # The deletion half of the rolling optimisation.  The agent's
+        # rule is "如果这个属性后面挂载句子效率低就丢弃这个属性或者
+        # 类" — an entry whose mount efficiency collapsed must be
+        # DISCARDED, not merely rejected on arrival.
+        #
+        # The prune pass runs on the table AS IT WILL BE AFTER the
+        # accepted gaps are added, so a newly accepted attribute is
+        # audited in the same run.  A newly added attribute that
+        # immediately fails the efficiency bar is therefore dropped
+        # before it can occupy a slot in the embedding matrix.
+        #
+        # The measurement is the same one used to accept candidates, so
+        # what the agent proposes it also audits — that symmetry is
+        # what makes the rolling optimisation converge.
+        if self.config.prune:
+            # The prune pass audits the table AS IT WILL BE AFTER the
+            # accepted gaps are added.  It works on a COPY of the
+            # schema, so a dry run (apply=False) does not mutate the
+            # live delta.
+            work_schema = self.schema.copy()
+
             for gap in report.accepted:
                 if gap.kind == "missing_attribute" and gap.proposal:
-                    self.schema.add_attribute(gap.proposal)
+                    work_schema.add_attribute(gap.proposal)
                 elif gap.kind == "missing_class":
                     cls = CLASS_CANDIDATE_LEXICON.get(gap.entity_type)
                     if cls:
-                        # Rebuild the FULL attribute list from the
-                        # lexicon, so the class gets all of its slots
-                        # and not just the primary one.
+                        attrs: List[AttributeSpec] = []
+                        for n, v in (cls.get("attributes") or {}).items():
+                            if v is None:
+                                attrs.append(
+                                    AttributeSpec(
+                                        name=n,
+                                        label=_attribute_label(n),
+                                        descriptor=_sg.ATTRIBUTE_DESCRIPTORS.get(n, ""),
+                                        stems=list(_sg._ATTRIBUTE_STEMS.get(n, [])),
+                                        types=[gap.entity_type],
+                                        source="reuse",
+                                    )
+                                )
+                            else:
+                                attrs.append(
+                                    AttributeSpec(
+                                        name=n,
+                                        label=v.get("label", ""),
+                                        descriptor=v.get("descriptor", ""),
+                                        stems=list(v.get("stems") or []),
+                                        triggers=list(v.get("triggers") or []),
+                                        types=[gap.entity_type],
+                                        source="lexicon",
+                                    )
+                                )
+                        work_schema.add_class(
+                            ClassSpec(
+                                entity_type=gap.entity_type,
+                                label=cls.get("label", ""),
+                                attributes=attrs,
+                            )
+                        )
+
+            removed_attrs, removed_classes, prune_metrics = self._prune(
+                all_profiles, all_node_types, work_schema,
+            )
+            report.removed_attributes = list(removed_attrs)
+            report.removed_classes = list(removed_classes)
+
+            # Record WHY each entry was dropped, so the report can show
+            # the numbers behind the removal.
+            for gap in report.gaps:
+                if gap.attribute in removed_attrs:
+                    m = prune_metrics.get(gap.attribute) or {}
+                    gap.metrics["pruned"] = True
+                    gap.metrics["prune_reason"] = (
+                        f"low-mount-efficiency: {int(m.get('mount_count', 0))} "
+                        f"sentences < {self.config.min_mount_count} "
+                        f"(rate {m.get('global_rate', 0.0):.3f})"
+                    )
+                    gap.verdict = "pruned"
+                    gap.reason = gap.metrics["prune_reason"]
+                    # A gap that was ACCEPTED and then pruned in the same
+                    # run must not stay in the accepted list — it is not
+                    # in the table.
+                    #
+                    # The membership test is by IDENTITY, not equality:
+                    # `AttributeGap` is a dataclass, so `==` compares
+                    # field by field, and two distinct gaps with the
+                    # same content would be mistaken for one another.
+                    for i, acc in enumerate(report.accepted):
+                        if acc is gap:
+                            report.accepted.pop(i)
+                            break
+                    if not any(p is gap for p in report.pruned):
+                        report.pruned.append(gap)
+
+            # Commit the removals.  A pruned attribute that was ACCEPTED
+            # in this same run must not reappear — so the tombstone is
+            # written over the proposal as well.
+            #
+            # In a DRY RUN the tombstones are NOT committed to the live
+            # schema: the report still shows what WOULD be removed (via
+            # `report.removed_attributes`), but the delta on disk stays
+            # untouched.  The audit itself ran on `work_schema`, a
+            # copy, so nothing else was mutated either.
+            if apply:
+                for name in removed_attrs:
+                    self.schema.remove_attribute(name)
+                for etype in removed_classes:
+                    self.schema.remove_class(etype)
+
+            self._set_progress_extra(
+                gaps=len(report.gaps),
+                ok=len(report.accepted),
+                no=len(report.rejected),
+                pruned=len(removed_attrs) + len(removed_classes),
+                attrs=len(self.schema.attributes),
+                classes=len(self.schema.classes),
+            )
+
+        # --- pass 6: apply -------------------------------------------
+        if apply:
+            # The accepted proposals are added AFTER the prune pass, so
+            # an attribute that was just pruned is not resurrected.
+            for gap in report.accepted:
+                if gap.kind == "missing_attribute" and gap.proposal:
+                    if self.schema.is_removed(gap.proposal.name):
+                        continue
+                    self.schema.add_attribute(gap.proposal)
+                elif gap.kind == "missing_class":
+                    if self.schema.is_class_removed(gap.entity_type):
+                        continue
+                    cls = CLASS_CANDIDATE_LEXICON.get(gap.entity_type)
+                    if cls:
                         attrs: List[AttributeSpec] = []
                         for n, v in (cls.get("attributes") or {}).items():
                             if v is None:
@@ -1745,6 +2098,7 @@ class AttributeAgent:
                     "gaps": len(report.gaps),
                     "ok": len(report.accepted),
                     "no": len(report.rejected),
+                    "pruned": len(report.pruned),
                     "attrs": len(self.schema.attributes),
                     "classes": len(self.schema.classes),
                     "llm": report.llm_calls,
@@ -1797,3 +2151,17 @@ def _parse_json_object(text: str) -> Optional[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # End of the attribute-table rolling optimisation agent block (2026-10-29).
 # ---------------------------------------------------------------------------
+
+
+# ==== [2026-10-30] 属性表滚动优化 Agent —— 剪枝（prune）通道 ====
+# [改动目的] 原 agent 只增不删：属性表只能单调增长，挂载效率已经崩溃
+#             的条目会一直占着 embedding 矩阵的一个槽位。原始需求要求
+#             "如果这个属性后面挂载句子效率低就丢弃这个属性或者类"。
+# [改动功能] 新增 pass 5 —— prune。用与接受候选完全相同的 _measure
+#             度量表内已有条目，把挂载效率低于门槛的属性/类丢弃。
+#             剪枝跑在"接受提案之后、应用之前"的工作副本上，所以
+#             本轮刚被接受的属性同样会被审计；剪掉的条目写入墓碑，
+#             应用阶段不会把它们重新加回表里。
+#             新增配置项 prune（开关）与 prune_scope（"delta" 只剪
+#             agent 自己加的条目 / "all" 连基础表一起剪）。
+# ==== end 属性表滚动优化 Agent —— 剪枝（prune）通道 ====

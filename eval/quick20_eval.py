@@ -89,6 +89,17 @@ def _em_score(prediction: str, ground_truth: str) -> bool:
 # -----------------------------------------------------------------------------
 from src.graph_builder import GraphBuilder, ComplementedSentence
 
+# R@k 的 gold 句子判定（唯一真相源，见 eval/recall_utils.py 的说明）。
+# 旧的子串判定会系统性低估 recall —— gold 为 'yes' 的题 R@k 恒为 0。
+from eval.recall_utils import (
+    GoldMatcher,
+    build_sentence_to_paragraph,
+    gold_passage_titles,
+    gold_sentence_matcher,
+    normalize_answer as _normalize_answer_recall,
+    passage_metrics,
+)
+
 
 def build_graph_from_hotpot(
     qdata: Dict[str, Any],
@@ -399,8 +410,13 @@ def main() -> int:
         help="Agent sampling rounds (default 10).",
     )
     ap.add_argument(
-        "--attr-agent-seed", type=int, default=1234,
-        help="Base seed of the agent's sampling (default 1234).",
+        "--attr-agent-seed", type=int, default=None,
+        help=(
+            "Base seed of the agent's sampling.  OMITTED by default: a "
+            "fresh random seed is drawn for every run so each run "
+            "explores the attribute table from a different angle.  The "
+            "seed that was used is printed and stored in the report."
+        ),
     )
     ap.add_argument(
         "--attr-agent-schema", default="",
@@ -425,6 +441,22 @@ def main() -> int:
     ap.add_argument(
         "--attr-agent-dry-run", action="store_true",
         help="Detect and report gaps but do NOT apply the delta.",
+    )
+    ap.add_argument(
+        "--attr-agent-no-prune", action="store_true",
+        help=(
+            "Disable the prune pass.  By default the agent DROPS the "
+            "table entries whose mount efficiency collapsed below the "
+            "gate, so the table does not only ever grow."
+        ),
+    )
+    ap.add_argument(
+        "--attr-agent-prune-scope", choices=["delta", "all"], default="delta",
+        help=(
+            "What the prune pass may touch.  'delta' (default) only "
+            "prunes entries the agent added; 'all' also prunes the "
+            "hand-designed base table."
+        ),
     )
     args = ap.parse_args()
 
@@ -576,6 +608,8 @@ def main() -> int:
             n_rounds=args.attr_agent_rounds,
             seed=args.attr_agent_seed,
             use_llm=not args.attr_agent_no_llm,
+            prune=not args.attr_agent_no_prune,
+            prune_scope=args.attr_agent_prune_scope,
             apply=not args.attr_agent_dry_run,
             client=client,
             schema=agent_schema,
@@ -638,6 +672,9 @@ def main() -> int:
                         "n_rejected": (
                             len(agent_report.rejected) if agent_report else 0
                         ),
+                        "n_pruned": (
+                            len(agent_report.pruned) if agent_report else 0
+                        ),
                         "llm_calls": (
                             agent_report.llm_calls if agent_report else 0
                         ),
@@ -650,6 +687,14 @@ def main() -> int:
                             g.entity_type
                             for g in (agent_report.accepted if agent_report else [])
                             if g.kind == "missing_class"
+                        ),
+                        "removed_attributes": sorted(
+                            agent_report.removed_attributes
+                            if agent_report else []
+                        ),
+                        "removed_classes": sorted(
+                            agent_report.removed_classes
+                            if agent_report else []
                         ),
                     },
                 },
@@ -677,6 +722,9 @@ def main() -> int:
                     "n_rejected": (
                         len(agent_report.rejected) if agent_report else 0
                     ),
+                    "n_pruned": (
+                        len(agent_report.pruned) if agent_report else 0
+                    ),
                     "accepted_attributes": sorted(
                         g.attribute
                         for g in (agent_report.accepted if agent_report else [])
@@ -686,6 +734,15 @@ def main() -> int:
                         g.entity_type
                         for g in (agent_report.accepted if agent_report else [])
                         if g.kind == "missing_class"
+                    ),
+                    # The entries the prune pass dropped from the table.
+                    "removed_attributes": sorted(
+                        agent_report.removed_attributes
+                        if agent_report else []
+                    ),
+                    "removed_classes": sorted(
+                        agent_report.removed_classes
+                        if agent_report else []
                     ),
                 },
             },
@@ -733,6 +790,25 @@ def _evaluate_sample(
     r1s: List[int] = []
     r5s: List[int] = []
     r10s: List[int] = []
+    # R@k 的分母：极性题（gold 是 yes/no）不计入，因为 yes/no 不是
+    # 句子片段，没有任何句子能"包含"它。把它记成 0 会系统性压低
+    # recall，把它算作命中会虚高 —— 正确做法是排除并报数。
+    r_scorable = 0
+    r_polar = 0
+    r_match_kinds: Counter = Counter()
+    # 段落级指标的累加器。key 形如 "passage_recall@5" / "hit@10"。
+    #
+    # **cut-off 集合是一处单一真相源**（`PASSAGE_KS`）——
+    # 累加器、每题计算、汇总表、JSON 落盘全部从它派生。
+    # 之前这几处各写各的 `@1/@5/@10` vs `@3/@5/@10`，结果汇总时读的
+    # key 根本不存在（`vals = []`），被 `max(3, ...)` 兜成 0 ——
+    # **指标静默变成 0，没有任何报错**。这类 bug 必须靠单一真相源根治。
+    PASSAGE_KS = (3, 5, 10)
+    passage_acc: Dict[str, List[float]] = {
+        f"passage_recall@{k}": [] for k in PASSAGE_KS
+    }
+    passage_acc.update({f"hit@{k}": [] for k in PASSAGE_KS})
+    p_scorable = 0
     paths: Counter = Counter()
     records: List[Dict[str, Any]] = []
     latencies: List[float] = []
@@ -863,16 +939,100 @@ def _evaluate_sample(
         f1s.append(f1)
         latencies.append((time.time() - t0) * 1000)
 
-        # Recall@1 vs R@5: gold sentence in top-1 / top-5 of final sids.
-        gold_norm = _normalize_answer(gold)
-        final_sids = list(getattr(res.pipeline_result, "step10_final_sids", []) or []) if res else []
+        # ─────────────────────────────────────────────────────────────
+        # Recall@1 / R@5 / R@10 — gold SUPPORTING-SENTENCE recall.
+        #
+        # **The old judgement was a substring test**:
+        #     gold_norm in _normalize_answer(node.text)
+        # which is wrong in BOTH directions (see eval/recall_utils.py
+        # for the full analysis):
+        #
+        #   · False NEGATIVES — gold 'yes' (HotpotQA's "same X?"
+        #     questions) appears in no context sentence at all, so those
+        #     questions were FORCED to R@k = 0 regardless of retrieval
+        #     quality.  In the seed-7 sample that is 1 of 20 questions,
+        #     so R@10 = 0.800 was really 0.850.
+        #   · False POSITIVES — gold 'Matthew Good' matched
+        #     "…on Matthew Good's own imprint…", a sentence about an
+        #     unrelated fact.
+        #
+        # The fix uses the dataset's OWN `supporting_facts` annotation
+        # (authoritative), falling back to word-boundary answer
+        # containment.
+        #
+        # Polar questions ('yes'/'no') are EXCLUDED from the R@k
+        # denominator rather than scored 0 — a yes/no answer is not a
+        # sentence span, so no sentence can "contain" it.
+        # ─────────────────────────────────────────────────────────────
+        matcher = gold_sentence_matcher(qdata, builder)
+
         def _sid_contains_gold(sid):
             n = builder.sentence_registry.get_node(sid)
-            return n is not None and gold_norm in _normalize_answer(n.text or "")
-        r1 = 1 if (final_sids and _sid_contains_gold(final_sids[0])) else 0
-        r5 = 1 if any(_sid_contains_gold(s) for s in final_sids[:5]) else 0
-        r10 = 1 if any(_sid_contains_gold(s) for s in final_sids[:10]) else 0
-        r1s.append(r1); r5s.append(r5); r10s.append(r10)
+            if n is None:
+                return False
+            return matcher.contains_answer(sid, n.text or "")
+
+        final_sids = list(
+            getattr(res.pipeline_result, "step10_final_sids", []) or []
+        ) if res else []
+
+        if matcher.is_scorable:
+            r1 = 1 if (final_sids and _sid_contains_gold(final_sids[0])) else 0
+            r5 = 1 if any(_sid_contains_gold(s) for s in final_sids[:5]) else 0
+            r10 = 1 if any(_sid_contains_gold(s) for s in final_sids[:10]) else 0
+            r1s.append(r1); r5s.append(r5); r10s.append(r10)
+            r_scorable += 1
+            r_match_kinds[matcher.match_kind] += 1
+        else:
+            # Polar question — R@k is undefined here.  Count it
+            # separately so the summary can report "N of M questions
+            # were scorable" instead of silently diluting the mean.
+            r_polar += 1
+            r1 = r5 = r10 = 0
+            log.info(
+                "  [RECALL-SKIP] %s polar gold=%r — excluded from R@k "
+                "(a yes/no answer is not a sentence span)",
+                qid[:8], gold,
+            )
+        r_match_kind = matcher.match_kind
+
+        # ─────────────────────────────────────────────────────────────
+        # 段落级指标（Passage Recall@k / Hit@k）
+        #
+        # 句子级 R@k 衡量的是"gold 支撑句有没有被检索到"，但多跳 QA 的
+        # 真正瓶颈是**证据段落** —— HotpotQA 每题有 2 个 gold 段落，
+        # 检索器要的是把这两个段落捞进上下文。
+        #
+        # 论文里的两种标准口径（都是段落粒度）：
+        #
+        #   口径 A —— Passage Recall@k（MDR / Xiong 2020）
+        #     |top-k ∩ gold| / |gold|，允许只抓到一半证据（贡献 0.5）
+        #
+        #   口径 B —— Hit@k / Pair Recall@k（GraphRAG / LongRAG）
+        #     必须全部 gold 段落都在 top-k，缺一个直接 0
+        #
+        # 详见 eval/recall_utils.py 的说明。两个口径都报，才能和不同
+        # 论文的数字对齐。
+        #
+        # 注意：极性题**不排除**在这里 —— 段落级指标和答案是不是
+        # yes/no 无关，它只看证据段落有没有被捞到。
+        # ─────────────────────────────────────────────────────────────
+        _sent_to_para = build_sentence_to_paragraph(qdata, builder)
+        _gold_paras = gold_passage_titles(qdata)
+        pmetrics = passage_metrics(
+            final_sids, _sent_to_para, _gold_paras, ks=PASSAGE_KS,
+        )
+        for _k, _v in pmetrics.items():
+            if _k == "n_gold_passages":
+                continue
+            # The key MUST exist in the accumulator.  If it doesn't, the
+            # cut-off sets have drifted apart — appending to a missing
+            # list would raise KeyError, which is what we want (a loud
+            # failure beats a silently-zero metric).
+            passage_acc[_k].append(_v)
+        p_n_gold = int(pmetrics.get("n_gold_passages", 0))
+        if p_n_gold:
+            p_scorable += 1
 
         # ─────────────────────────────────────────────────────────────
         # [DIAG] Pool & gold-sentence audit — locate WHERE the gold
@@ -881,7 +1041,9 @@ def _evaluate_sample(
         # ─────────────────────────────────────────────────────────────
         diag = {
             "r10_status": ("HIT" if r10 else "MISS"),
-            "gold_norm": gold_norm[:40],
+            "gold_norm": matcher.gold_norm[:40],
+            "gold_match_kind": matcher.match_kind,
+            "gold_r_scorable": matcher.is_scorable,
             "n_entities": len(res.pipeline_result.step1_entities) if res else 0,
         }
         gold_sentence_ids: List[str] = []
@@ -890,57 +1052,28 @@ def _evaluate_sample(
         gold_in_final = False
         gold_in_any_container = False
         try:
-            # The question carries supporting_facts (gold sentences).
-            # NOTE: hotpot stores them as [[title, sent_idx], ...] OR
-            # as [{title, sentence_id}, ...].  Handle both.
-            if isinstance(qdata, dict):
-                sfacts = qdata.get("supporting_facts") or qdata.get("support_facts") or []
-                para = qdata.get("context") or []
-
-                def _sf_title_idx(sf):
-                    if isinstance(sf, dict):
-                        return (sf.get("title") or "", int(sf.get("sentence_id") or 0))
-                    if isinstance(sf, (list, tuple)) and len(sf) >= 2:
-                        return (sf[0] or "", int(sf[1] or 0))
-                    return ("", -1)
-
-                gold_titles: set = set()
-                gold_sentence_ids: List[str] = []
-                for sf in sfacts:
-                    gold_title_raw, gold_sidx = _sf_title_idx(sf)
-                    gold_title = gold_title_raw.lower().strip()
-                    if not gold_title or gold_sidx < 0:
-                        continue
-                    gold_titles.add(gold_title)
-                    sentence_text = None
-                    for p in para:
-                        if (isinstance(p, list) and len(p) == 2
-                                and (p[0] or "").lower().strip() == gold_title):
-                            p_sids = p[1]
-                            if isinstance(p_sids, list) and gold_sidx < len(p_sids):
-                                sentence_text = p_sids[gold_sidx]
-                            break
-                    if not sentence_text:
-                        continue
-                    nodes = getattr(builder.sentence_registry, "_nodes", {}) or {}
-                    matched = False
-                    for sid, node in nodes.items():
-                        try:
-                            if getattr(node, "text", "") == sentence_text:
-                                gold_sentence_ids.append(sid)
-                                matched = True
-                                break
-                        except Exception:
-                            continue
-                    if not matched:
-                        sn = _normalize_answer(sentence_text)
-                        for sid, node in nodes.items():
-                            try:
-                                if _normalize_answer(getattr(node, "text", "") or "") == sn:
-                                    gold_sentence_ids.append(sid)
-                                    break
-                            except Exception:
-                                continue
+            # The gold supporting sentences come from the dataset's own
+            # `supporting_facts` annotation.
+            #
+            # This used to be a SECOND, independent implementation of the
+            # same logic that now lives in `eval/recall_utils.py` (which
+            # R@k uses).  Two copies of the same parsing rule is how they
+            # drift apart — the R@k path and the DIAG path would then
+            # disagree about which sentence is gold, and the diagnostics
+            # would contradict the metrics they explain.  One
+            # implementation, both callers.
+            gold_sentence_ids = sorted(matcher.gold_sids)
+            gold_titles = set()
+            for _sf in (
+                qdata.get("supporting_facts")
+                or qdata.get("support_facts") or []
+            ):
+                _t = (
+                    _sf.get("title") if isinstance(_sf, dict)
+                    else (_sf[0] if isinstance(_sf, (list, tuple)) and _sf else "")
+                )
+                if _t:
+                    gold_titles.add(str(_t).lower().strip())
             gold_sent_ids_set = set(gold_sentence_ids)
             # Layered inspection.
             diag["gold_sentence_ids"] = gold_sentence_ids
@@ -1066,7 +1199,9 @@ def _evaluate_sample(
             diag["diag_error"] = str(_diag_err)
 
         # Log every RECALL-MISS explicitly so the run log tells us the cascade result.
-        if r10 == 0 and res is not None:
+        # Polar questions are skipped — their R@10 is undefined, so a
+        # "MISS" verdict would be a false alarm.
+        if r10 == 0 and res is not None and matcher.is_scorable:
             log.warning(
                 "[DIAG] %s r10=MISS | entities=%d | n_gold_sents=%d | verdict=%s | cascade=%s | gold_titles=%s",
                 qid[:8],
@@ -1077,14 +1212,23 @@ def _evaluate_sample(
                 diag.get("gold_titles", []),
             )
 
+        # Polar questions have no defined R@k — show "n/a" rather than a
+        # misleading 0, which would look like a retrieval miss.
+        def _rk(v):
+            return "n/a" if not matcher.is_scorable else str(v)
         log.info(
-            "  [%2d/%2d] %s  path=%s  EM=%s F1=%.3f R@1=%d R@5=%d R@10=%d  lat=%.0fms\n"
-            "         Q: %s\n"
+            "  [%2d/%2d] %s  path=%s  EM=%s F1=%.3f R@1=%s R@5=%s R@10=%s  lat=%.0fms\n"
+            "         passage: PR@%d=%.2f Hit@%d=%.0f (gold paras=%d)  |  "
+            "Q: %s\n"
             "         G: %s\n"
             "         A: %s",
             i + 1, len(sample), qid[:8],
             res.path if res else "?",
-            "✓" if em_hit else "✗", f1, r1, r5, r10, latencies[-1],
+            "✓" if em_hit else "✗", f1, _rk(r1), _rk(r5), _rk(r10),
+            latencies[-1],
+            PASSAGE_KS[1], pmetrics.get(f"passage_recall@{PASSAGE_KS[1]}", 0.0),
+            PASSAGE_KS[1], pmetrics.get(f"hit@{PASSAGE_KS[1]}", 0.0),
+            int(pmetrics.get("n_gold_passages", 0)),
             question[:120],
             gold[:80],
             answer[:80],
@@ -1116,6 +1260,74 @@ def _evaluate_sample(
         # TEST 2: pass gold sids to pipeline for gold-in-removed logging
         disp.pipeline._diag_gold_sids = gold_sentence_ids
 
+        # ─────────────────────────────────────────────────────────────
+        # [RANK-DIAG] 精排诊断：gold 句子是在哪一环被挤掉的？
+        #
+        # 用户实测的现象是"recall↑ 但 EM↓" —— 属性把 gold 句子带进了
+        # 候选池，却没把它排到第一。这个诊断直接回答：gold 句子
+        #   · 在候选池里吗？          （不在 → 是召回层的问题）
+        #   · 过了属性门吗？          （没过 → 是属性门校准的问题）
+        #   · 排第几？                （排后面 → 是精排公式的问题）
+        #   · 五个分量各是多少？      （定位到具体哪个信号失灵）
+        #
+        # 没有这个诊断，EM 下降只能靠猜。
+        # ─────────────────────────────────────────────────────────────
+        rank_diag: Dict[str, Any] = {}
+        try:
+            ef_scores = (
+                res.pipeline_result.debug.get("ef_scores", [])
+                if res and res.pipeline_result else []
+            )
+            if ef_scores and gold_sentence_ids:
+                gold_set = set(gold_sentence_ids)
+                # 按 final_score 排出的名次
+                ordered = sorted(
+                    ef_scores, key=lambda d: -d.get("final_score", 0.0)
+                )
+                for rank, d in enumerate(ordered, 1):
+                    if d.get("sentence_id") in gold_set:
+                        rank_diag = {
+                            "gold_in_pool": True,
+                            "gold_rank": rank,
+                            "gold_gate_kept": d.get("attr_gate_kept"),
+                            "gold_gate_level": d.get("attr_gate_level"),
+                            "gold_final": round(d.get("final_score", 0.0), 4),
+                            # 五个归一化分量 —— 看哪个信号把 gold 压下去了
+                            "gold_norm": {
+                                "name": round(d.get("norm_name", 0.0), 3),
+                                "sent": round(d.get("norm_sent", 0.0), 3),
+                                "fact": round(d.get("norm_fact", 0.0), 3),
+                                "attr": round(d.get("norm_attr", 0.0), 3),
+                                "lex": round(d.get("norm_lex", 0.0), 3),
+                            },
+                            # 排第一的那个候选人的同一组分量 —— 直接对比
+                            "top_norm": (
+                                {
+                                    "name": round(ordered[0].get("norm_name", 0.0), 3),
+                                    "sent": round(ordered[0].get("norm_sent", 0.0), 3),
+                                    "fact": round(ordered[0].get("norm_fact", 0.0), 3),
+                                    "attr": round(ordered[0].get("norm_attr", 0.0), 3),
+                                    "lex": round(ordered[0].get("norm_lex", 0.0), 3),
+                                }
+                                if ordered else {}
+                            ),
+                            "n_scored": len(ordered),
+                        }
+                        break
+                if not rank_diag:
+                    rank_diag = {
+                        "gold_in_pool": False,
+                        "n_scored": len(ordered),
+                    }
+        except Exception as _rd_err:
+            rank_diag = {"rank_diag_error": str(_rd_err)}
+        if rank_diag:
+            log.info(
+                "[RANK-DIAG] %s  %s",
+                qid[:8],
+                json.dumps(rank_diag, ensure_ascii=False),
+            )
+
         # Query relations (kept for diagnostics; the mapper is gone).
         q_relations = (res.pipeline_result.debug.get("query_relations", {}) if res and res.pipeline_result else {})
         log.info("Attr soft match: q_relations=%s gold_mounts=%s",
@@ -1132,8 +1344,15 @@ def _evaluate_sample(
             "r1": r1,
             "r5": r5,
             "r10": r10,
+            # 段落级指标（逐题）：passage_recall@k 是口径 A，hit@k 是口径 B。
+            "passage": pmetrics,
             "latency_ms": latencies[-1],
             "diag": diag,
+            # [RANK-DIAG] gold 句子在精排里的位置与五个分量的取值。
+            # 这是定位"recall↑ 但 EM↓"的直接证据：gold_rank 很大 →
+            # 精排问题；gold_in_pool=False → 召回问题；
+            # gold_gate_kept=False → 属性门校准问题。
+            "rank_diag": rank_diag,
             "debug": res.pipeline_result.debug if res and res.pipeline_result else {},
             # Extra diag fields for attribute-soft-match analysis
             "filter_diag": {
@@ -1172,18 +1391,151 @@ def _evaluate_sample(
                 "r10": 0.0, "paths": {}, "hybrid": {}}, records
     em_avg = sum(ems) / len(ems)
     f1_avg = sum(f1s) / len(f1s)
+    # The R@k denominators are the SCORABLE question count — polar
+    # questions ('yes'/'no' gold) are excluded because no sentence can
+    # "contain" a yes/no answer.  `len(r1s)` already holds exactly that
+    # count, so the mean is over the right denominator.
     r1_avg = sum(r1s) / max(1, len(r1s))
     r5_avg = sum(r5s) / max(1, len(r5s))
     r10_avg = sum(r10s) / max(1, len(r10s))
     log.info("=" * 60)
     log.info("n=%d  EM=%.3f  F1=%.3f  R@1=%.3f  R@5=%.3f  R@10=%.3f",
              len(ems), em_avg, f1_avg, r1_avg, r5_avg, r10_avg)
+    log.info(
+        "Recall denominator: %d scorable / %d total "
+        "(%d polar excluded, %s)",
+        r_scorable, len(ems), r_polar, dict(r_match_kinds),
+    )
+
+    # ─────────────────────────────────────────────────────────────
+    # 段落级指标汇总
+    #
+    # 口径 A —— Passage Recall@k（MDR / Xiong 2020）：
+    #     |top-k ∩ gold_passages| / |gold_passages|，逐题平均。
+    #     允许只抓到一半证据就得分。
+    #
+    # 口径 B —— Hit@k（GraphRAG / LongRAG 的 Pair Recall@k）：
+    #     必须全部 gold 段落都在 top-k 才算成功，缺一个直接 0。
+    #
+    # 两者都是段落粒度，这才是多跳检索论文里可比的口径。
+    # ─────────────────────────────────────────────────────────────
+    passage_summary: Dict[str, float] = {}
+    if p_scorable:
+        log.info("-" * 60)
+        log.info("Passage-level (n=%d queries):", p_scorable)
+        # The header is derived from PASSAGE_KS so it can never drift
+        # out of sync with the values printed below it.
+        log.info(
+            "  %-28s %s",
+            "metric",
+            "".join(f"{('@' + str(k)):>8}" for k in PASSAGE_KS),
+        )
+        for family, label in (
+            ("passage_recall", "Passage Recall@k (口径A)"),
+            ("hit", "Hit@k (口径B)"),
+        ):
+            row = []
+            for k in PASSAGE_KS:
+                key = f"{family}@{k}"
+                vals = passage_acc.get(key) or []
+                # The denominator is the number of SCORED questions.
+                # Do NOT floor it at 3 — that hides an empty accumulator
+                # behind a plausible-looking number.  If the list is
+                # empty, report 0 and say so.
+                row.append(sum(vals) / len(vals) if vals else 0.0)
+            passage_summary[family] = {
+                str(k): row[i] for i, k in enumerate(PASSAGE_KS)
+            }
+            log.info(
+                "  %-28s %s",
+                label,
+                "".join(f"{v:8.3f}" for v in row),
+            )
+        log.info(
+            "  (Hit@k = 所有 gold 段落都在 top-k 才算 1；"
+            "Passage Recall@k 允许部分命中)"
+        )
     log.info("Path breakdown: %s", dict(paths))
     log.info("Avg latency: %.0fms", sum(latencies) / max(1, len(latencies)))
     log.info("Hybrid config: mode=%s  w_bm25=%.2f  w_dense=%.2f",
              args.hybrid_mode,
              args.bm25_weight if 0 <= args.bm25_weight <= 1 else 0.5,
              1.0 - (args.bm25_weight if 0 <= args.bm25_weight <= 1 else 0.5))
+
+    # ─────────────────────────────────────────────────────────────
+    # [RANK-DIAG] 汇总：EM 掉在哪一环？
+    #
+    # 把每题归到三个互斥的桶里，一眼看出瓶颈：
+    #   · 召回丢失  gold 根本没进候选池        → 召回层的问题
+    #   · 门杀掉了  gold 进池了但被属性门删掉    → 属性门校准的问题
+    #   · 排序丢失  gold 活着但没排到第一      → 精排公式的问题
+    # ─────────────────────────────────────────────────────────────
+    n_diag = 0
+    n_not_in_pool = 0
+    n_gated_out = 0
+    n_ranked_out = 0
+    n_rank1 = 0
+    rank_sum = 0
+    comp_sum: Dict[str, float] = {
+        "name": 0.0, "sent": 0.0, "fact": 0.0, "attr": 0.0, "lex": 0.0,
+    }
+    top_comp_sum: Dict[str, float] = {
+        "name": 0.0, "sent": 0.0, "fact": 0.0, "attr": 0.0, "lex": 0.0,
+    }
+    for rec in records:
+        rd = rec.get("rank_diag") or {}
+        if not rd or "gold_in_pool" not in rd:
+            continue
+        n_diag += 1
+        if not rd.get("gold_in_pool"):
+            n_not_in_pool += 1
+            continue
+        if rd.get("gold_gate_kept") is False:
+            n_gated_out += 1
+        if rd.get("gold_rank") == 1:
+            n_rank1 += 1
+        if isinstance(rd.get("gold_rank"), int):
+            rank_sum += rd["gold_rank"]
+        for k in comp_sum:
+            comp_sum[k] += float((rd.get("gold_norm") or {}).get(k, 0.0))
+            top_comp_sum[k] += float((rd.get("top_norm") or {}).get(k, 0.0))
+    if n_diag:
+        denom = max(1, n_diag)
+        log.info("=" * 60)
+        log.info(
+            "[RANK-DIAG] n=%d | 召回丢失=%d  门删掉=%d  排序丢失=%d  "
+            "gold排第1=%d | gold平均名次=%.1f",
+            n_diag,
+            n_not_in_pool,
+            n_gated_out,
+            max(0, n_diag - n_not_in_pool - n_gated_out - n_rank1),
+            n_rank1,
+            rank_sum / denom,
+        )
+        log.info(
+            "[RANK-DIAG] gold 平均分量: name=%.3f sent=%.3f fact=%.3f "
+            "attr=%.3f lex=%.3f",
+            comp_sum["name"] / denom, comp_sum["sent"] / denom,
+            comp_sum["fact"] / denom, comp_sum["attr"] / denom,
+            comp_sum["lex"] / denom,
+        )
+        log.info(
+            "[RANK-DIAG] top1 平均分量: name=%.3f sent=%.3f fact=%.3f "
+            "attr=%.3f lex=%.3f",
+            top_comp_sum["name"] / denom, top_comp_sum["sent"] / denom,
+            top_comp_sum["fact"] / denom, top_comp_sum["attr"] / denom,
+            top_comp_sum["lex"] / denom,
+        )
+        log.info(
+            "[RANK-DIAG] gold 相对 top1 的差距: "
+            "name=%+.3f sent=%+.3f fact=%+.3f attr=%+.3f lex=%+.3f",
+            (comp_sum["name"] - top_comp_sum["name"]) / denom,
+            (comp_sum["sent"] - top_comp_sum["sent"]) / denom,
+            (comp_sum["fact"] - top_comp_sum["fact"]) / denom,
+            (comp_sum["attr"] - top_comp_sum["attr"]) / denom,
+            (comp_sum["lex"] - top_comp_sum["lex"]) / denom,
+        )
+        log.info("=" * 60)
 
     w_bm25 = args.bm25_weight if 0 <= args.bm25_weight <= 1 else 0.5
     summary: Dict[str, Any] = {
@@ -1198,6 +1550,28 @@ def _evaluate_sample(
             "mode": args.hybrid_mode,
             "w_bm25": w_bm25,
             "w_dense": 1.0 - w_bm25,
+        },
+        # R@k 的分母信息 —— 极性题被排除，必须随指标一起落盘，
+        # 否则跨运行的 R@k 数字不可比（分母不同）。
+        "recall_denominator": {
+            "n_scorable": r_scorable,
+            "n_polar_excluded": r_polar,
+            "match_kinds": dict(r_match_kinds),
+        },
+        # 段落级指标（多跳检索论文的标准口径）。
+        #   passage_recall@k —— 口径 A（MDR / Xiong 2020）
+        #   hit@k           —— 口径 B（GraphRAG / LongRAG）
+        "passage": {
+            "n_scorable": p_scorable,
+            **passage_summary,
+        },
+        # 精排瓶颈定位（见上面的 [RANK-DIAG] 汇总日志）
+        "rank_diag": {
+            "n_diag": n_diag,
+            "n_not_in_pool": n_not_in_pool,
+            "n_gated_out": n_gated_out,
+            "n_rank1": n_rank1,
+            "avg_gold_rank": (rank_sum / n_diag) if n_diag else 0.0,
         },
     }
     return summary, records
@@ -1513,12 +1887,24 @@ def _run_hyperedge_compare(
             log.debug("LLM re-extract on hyperedge side failed: %s", e)
 
     # ---- Scoring ----
-    gold_norm = _normalize_answer(gold)
+    # Same gold-matching rules as the main path (see eval/recall_utils.py):
+    # supporting_facts first, word-boundary answer containment as fallback,
+    # polar questions excluded from the R@k denominator.
+    matcher = gold_sentence_matcher(qdata, builder)
+
     def _contains_gold(sid):
         n = builder.sentence_registry.get_node(sid)
-        return n is not None and gold_norm in _normalize_answer(n.text or "")
+        if n is None:
+            return False
+        return matcher.contains_answer(sid, n.text or "")
 
     def _score(sids, pred):
+        if not matcher.is_scorable:
+            # Polar question — R@k undefined.  Report -1 so the caller
+            # can tell "excluded" apart from "scored 0".
+            em = _em_answer(pred, gold) if pred else False
+            f1 = _f1(pred, gold) if pred else 0.0
+            return -1, -1, -1, em, f1
         r1 = 1 if (sids and _contains_gold(sids[0])) else 0
         r5 = 1 if any(_contains_gold(s) for s in sids[:5]) else 0
         r10 = 1 if any(_contains_gold(s) for s in sids[:10]) else 0
@@ -1586,18 +1972,33 @@ def _main_hyperedge_compare(
 
         rec["latency_ms"] = rec_latency
         records.append(rec)
+        # -1 = polar question, excluded from R@k.  Show "n/a" rather
+        # than a misleading -1 in the per-question log line.
+        def _rr(v):
+            return "n/a" if v is None or v < 0 else str(v)
         log.info(
-            "  [%2d/%2d] %s  base R@1=%d R@5=%d  he R@1=%d R@5=%d  "
+            "  [%2d/%2d] %s  base R@1=%s R@5=%s  he R@1=%s R@5=%s  "
             "bridge=%s(+%d)  em_b=%s em_h=%s  (%.0fms)",
             i + 1, len(sample), rec["qid"][:8],
-            b["r1"], b["r5"], h["r1"], h["r5"],
+            _rr(b["r1"]), _rr(b["r5"]), _rr(h["r1"]), _rr(h["r5"]),
             "✓" if rec["bridge"]["ran"] else "·",
             rec["bridge"]["n_bridge_sids_added"],
             "Y" if b["em"] else "N", "Y" if h["em"] else "N",
             rec_latency,
         )
 
-    def _m(xs): return sum(xs) / max(1, len(xs))
+    def _m(xs):
+        """Mean over the SCORABLE entries only.
+
+        Polar questions ('yes'/'no' gold) are recorded as -1 by
+        `_score` — they are excluded from the R@k denominator rather
+        than counted as a miss.  Averaging them in would silently
+        depress the mean by an amount that depends on how many polar
+        questions the sample happens to contain.
+        """
+        vals = [x for x in xs if x >= 0]
+        return sum(vals) / max(1, len(vals))
+
     summary = {
         "n": len(records),
         "n_bridge_fired": n_bridge_fired,

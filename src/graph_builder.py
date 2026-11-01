@@ -808,6 +808,10 @@ class GraphBuilder:
                 embedder.encode(
                     [ATTRIBUTE_DESCRIPTORS[a] for a in ATTRIBUTE_NAMES],
                     normalize_embeddings=True,
+                    # The sentence-transformers progress bar restarts on
+                    # every encode and drowns out the agent's own
+                    # progress line.  Off — the agent reports progress.
+                    show_progress_bar=False,
                 ),
                 dtype=_np.float32,
             ).reshape(len(ATTRIBUTE_NAMES), -1)

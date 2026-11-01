@@ -70,6 +70,21 @@ from . import sentence_graph as _sg
 # ==== end 属性表滚动优化 Agent ====
 
 
+# ==== [2026-10-30] 属性表滚动优化 Agent —— 删除（剪枝）通道 ====
+# [改动目的] agent 原本只增不删，属性表只能单调增长；挂载效率已经
+#             崩溃的属性会一直占着 embedding 矩阵的一个槽位，白白
+#             吃掉召回。原始需求明确要求"如果这个属性后面挂载句子
+#             效率低就丢弃这个属性或者类"。
+# [改动功能] AttributeSchema 增加 remove_attribute / remove_class，
+#             以 TOMBSTONE（removed_attributes / removed_classes）
+#             记录删除。墓碑随 JSON 一起持久化、随 load 一起恢复，
+#             否则重新加载时 sentence_graph 里的基础表会把被删的
+#             条目复活。effective_templates 在合并基础表 + 增量之
+#             后统一套用墓碑；apply_to_modules / apply_to_registry
+#             把墓碑从模块级表和在线 registry 中真正删除。
+# ==== end 属性表滚动优化 Agent —— 删除（剪枝）通道 ====
+
+
 # ---------------------------------------------------------------------------
 # Candidate lexicons
 #
@@ -463,9 +478,17 @@ class AttributeSchema:
         self,
         attributes: Optional[Dict[str, AttributeSpec]] = None,
         classes: Optional[Dict[str, ClassSpec]] = None,
+        removed_attributes: Optional[Dict[str, bool]] = None,
+        removed_classes: Optional[Dict[str, bool]] = None,
     ) -> None:
         self.attributes: Dict[str, AttributeSpec] = dict(attributes or {})
         self.classes: Dict[str, ClassSpec] = dict(classes or {})
+        # Tombstones: attributes / classes the agent has DROPPED.  They
+        # are kept alongside the live entries so that the removal
+        # survives a save / load round trip (the base table in
+        # `sentence_graph` would otherwise resurrect them).
+        self.removed_attributes: Dict[str, bool] = dict(removed_attributes or {})
+        self.removed_classes: Dict[str, bool] = dict(removed_classes or {})
 
     # -- mutation ------------------------------------------------------
 
@@ -481,24 +504,138 @@ class AttributeSchema:
             return
         self.classes[spec.entity_type] = spec
 
+    # -- removal -------------------------------------------------------
+    #
+    # The agent's rule is "如果这个属性后面挂载句子效率低就丢弃这个属性
+    # 或者类" — an attribute (or a whole entity class) whose mount
+    # efficiency is too low must be DROPPED, not merely rejected on
+    # arrival.  Without a removal path the table could only ever grow,
+    # and a stale attribute kept occupying a slot in the embedding
+    # matrix would keep costing recall.
+    #
+    # The removal is recorded as a TOMBSTONE rather than by deleting
+    # the key, because the delta is persisted to JSON and reloaded: a
+    # tombstone survives the round trip, a deleted key does not (the
+    # base table in `sentence_graph` would resurrect it).
+
+    def remove_attribute(self, name: str) -> bool:
+        """
+        Drop an attribute from the delta.
+
+        The attribute is recorded in `removed_attributes` as a
+        tombstone.  Returns True when a tombstone was recorded.
+        """
+        if not name:
+            return False
+        self.attributes.pop(name, None)
+        self.removed_attributes[name] = True
+        return True
+
+    def remove_class(self, entity_type: str) -> bool:
+        """
+        Drop an entity class from the delta.
+
+        A class carries its attributes with it: the attributes that ONLY
+        this class declared are dropped too, because they would
+        otherwise be orphans with no owner.  An attribute that another
+        class also declares survives — it still has a home.
+        """
+        if not entity_type:
+            return False
+        cspec = self.classes.pop(entity_type, None)
+        self.removed_classes[entity_type] = True
+        if cspec is None:
+            # The class is not in the delta — it is a BASE class (this
+            # happens with `prune_scope="all"`).  Its attributes still
+            # have to be cleaned up, so they are read from the base
+            # table instead of from a delta spec.
+            base_tmpl = _sg._ATTRIBUTE_TEMPLATES.get(entity_type) or {}
+            attr_names = [
+                n for n in base_tmpl.keys() if n and n != "other"
+            ]
+        else:
+            attr_names = [a.name for a in cspec.attributes if a.name]
+
+        # Which other classes declare each of this class's attributes?
+        # `effective_templates()` is called AFTER the tombstone was set,
+        # so the class being removed is already excluded — exactly what
+        # is wanted here.
+        templates = self.effective_templates()
+        for name in attr_names:
+            if not name or self.is_removed(name):
+                continue
+            other_owners = [
+                t for t, tmpl in templates.items()
+                if t != entity_type and name in tmpl
+            ]
+            if not other_owners:
+                # This class was the attribute's only home.
+                self.remove_attribute(name)
+        return True
+
+    def is_removed(self, name: str) -> bool:
+        """Whether an attribute has been tombstoned by the agent."""
+        return name in self.removed_attributes
+
+    def is_class_removed(self, entity_type: str) -> bool:
+        """Whether an entity class has been tombstoned by the agent."""
+        return entity_type in self.removed_classes
+
     # -- reading -------------------------------------------------------
+
+    def copy(self) -> "AttributeSchema":
+        """
+        A deep-enough copy of the delta.
+
+        The specs themselves are treated as immutable value objects, so
+        only the mappings are duplicated.  The prune pass works on a
+        copy so that a dry run never mutates the live delta.
+        """
+        return AttributeSchema(
+            attributes=dict(self.attributes),
+            classes=dict(self.classes),
+            removed_attributes=dict(self.removed_attributes),
+            removed_classes=dict(self.removed_classes),
+        )
 
     def effective_templates(self) -> Dict[str, Dict[str, str]]:
         """
-        The full template table: hard-coded base + delta.
+        The full template table: hard-coded base + delta - tombstones.
 
         Returns {entity_type: {attribute_name: label}}.
+
+        A tombstoned class disappears entirely; a tombstoned attribute
+        disappears from every template that declared it.  The base
+        table is filtered AFTER the delta is merged, so a tombstone
+        also removes an attribute that the base table declared (not
+        only one the agent added).
         """
         out: Dict[str, Dict[str, str]] = {
             etype: dict(tmpl) for etype, tmpl in _sg._ATTRIBUTE_TEMPLATES.items()
         }
         for spec in self.attributes.values():
+            if self.is_removed(spec.name):
+                continue
             for etype in spec.types:
                 out.setdefault(etype, {}).setdefault(spec.name, spec.label)
         for cspec in self.classes.values():
+            if self.is_class_removed(cspec.entity_type):
+                continue
             tmpl = out.setdefault(cspec.entity_type, {})
             for attr in cspec.attributes:
+                if self.is_removed(attr.name):
+                    continue
                 tmpl.setdefault(attr.name, attr.label)
+
+        # Apply the tombstones to the merged table.
+        for etype in list(out.keys()):
+            if self.is_class_removed(etype):
+                del out[etype]
+                continue
+            tmpl = out[etype]
+            for name in list(tmpl.keys()):
+                if self.is_removed(name):
+                    del tmpl[name]
         return out
 
     def known_types(self) -> set:
@@ -507,6 +644,8 @@ class AttributeSchema:
 
     def descriptor_for(self, name: str) -> str:
         """Return the descriptor of an attribute (delta first, then base)."""
+        if self.is_removed(name):
+            return ""
         spec = self.attributes.get(name)
         if spec and spec.descriptor:
             return spec.descriptor
@@ -530,8 +669,30 @@ class AttributeSchema:
         `graph_builder` and `stengraph_pipeline` import these objects by
         name at module-import time; rebinding the module attribute would
         leave them pointing at the old list.
+
+        Tombstoned attributes / classes are REMOVED from the live
+        tables.  This is the deletion half of the rolling optimisation:
+        without it an attribute whose mount efficiency collapsed would
+        keep occupying a slot in the embedding matrix forever.
         """
+        # -- removal first ------------------------------------------------
+        # The removal must happen BEFORE the addition, so an attribute
+        # that is tombstoned in the same run as it was proposed is not
+        # resurrected by the delta.
+        for name in self.removed_attributes:
+            _sg.ATTRIBUTE_DESCRIPTORS.pop(name, None)
+            if name in _sg.ATTRIBUTE_NAMES:
+                _sg.ATTRIBUTE_NAMES.remove(name)
+            _sg._ATTRIBUTE_STEMS.pop(name, None)
+            _sg._ATTRIBUTE_PATTERNS.pop(name, None)
+            for tmpl in _sg._ATTRIBUTE_TEMPLATES.values():
+                tmpl.pop(name, None)
+        for etype in self.removed_classes:
+            _sg._ATTRIBUTE_TEMPLATES.pop(etype, None)
+
         for spec in self.attributes.values():
+            if self.is_removed(spec.name):
+                continue
             if spec.descriptor:
                 _sg.ATTRIBUTE_DESCRIPTORS[spec.name] = spec.descriptor
             if spec.name not in _sg.ATTRIBUTE_NAMES:
@@ -542,16 +703,20 @@ class AttributeSchema:
                 _sg._ATTRIBUTE_PATTERNS[spec.name] = list(pats)
 
         for spec in self.attributes.values():
+            if self.is_removed(spec.name):
+                continue
             for etype in spec.types:
                 _sg._ATTRIBUTE_TEMPLATES.setdefault(etype, {}).setdefault(
                     spec.name, spec.label
                 )
 
         for cspec in self.classes.values():
+            if self.is_class_removed(cspec.entity_type):
+                continue
             tmpl = _sg._ATTRIBUTE_TEMPLATES.setdefault(cspec.entity_type, {})
             for attr in cspec.attributes:
-                # A class attribute may reuse a global attribute that the
-                # delta does not define; inherit its descriptor/stems.
+                if self.is_removed(attr.name):
+                    continue
                 if attr.name not in self.attributes:
                     base_desc = _sg.ATTRIBUTE_DESCRIPTORS.get(attr.name, "")
                     if base_desc and not attr.descriptor:
@@ -579,6 +744,19 @@ class AttributeSchema:
         be written into the registry explicitly.
         """
         templates = self.effective_templates()
+        # Removal: drop the tombstoned classes / attributes from the
+        # live registry, otherwise a freshly created registry would
+        # still mount them.
+        for etype in list(registry._templates.keys()):
+            if self.is_class_removed(etype):
+                registry._templates.pop(etype, None)
+                continue
+            tmpl = registry._templates[etype]
+            for name in list(tmpl.keys()):
+                if self.is_removed(name):
+                    tmpl.pop(name, None)
+        for name in self.removed_attributes:
+            registry._patterns.pop(name, None)
         for etype, tmpl in templates.items():
             if etype not in registry._templates:
                 registry._templates[etype] = dict(tmpl)
@@ -637,10 +815,22 @@ class AttributeSchema:
             "classes": {
                 etype: cspec.to_dict() for etype, cspec in self.classes.items()
             },
+            # Tombstones — the deletion half of the rolling
+            # optimisation.  Without them a reloaded delta would
+            # resurrect the dropped attributes.
+            "removed_attributes": sorted(self.removed_attributes.keys()),
+            "removed_classes": sorted(self.removed_classes.keys()),
         }
 
     @classmethod
     def from_dict(cls, d: Dict) -> "AttributeSchema":
+        removed_attrs = d.get("removed_attributes") or []
+        removed_cls = d.get("removed_classes") or []
+        # Accept both a list of names and a dict of name -> True.
+        if isinstance(removed_attrs, dict):
+            removed_attrs = list(removed_attrs.keys())
+        if isinstance(removed_cls, dict):
+            removed_cls = list(removed_cls.keys())
         return cls(
             attributes={
                 name: AttributeSpec.from_dict(a)
@@ -650,6 +840,8 @@ class AttributeSchema:
                 etype: ClassSpec.from_dict(c)
                 for etype, c in (d.get("classes") or {}).items()
             },
+            removed_attributes={str(n): True for n in removed_attrs},
+            removed_classes={str(n): True for n in removed_cls},
         )
 
     def save(self, path) -> Path:
@@ -722,10 +914,30 @@ class AttributeSchema:
                     lines.append(f'if "{attr.name}" not in ATTRIBUTE_NAMES:')
                     lines.append(f'    ATTRIBUTE_NAMES.append("{attr.name}")')
 
+        # The tombstones — the deletions.  They are exported as a
+        # removal block so a human pasting the snippet into
+        # `sentence_graph.py` also drops the stale entries.
+        if self.removed_attributes or self.removed_classes:
+            lines.append("")
+            lines.append("# --- removed (pruned by the agent) ---")
+            for name in sorted(self.removed_attributes):
+                lines.append(f'_ATTRIBUTE_DESCRIPTORS.pop("{name}", None)')
+                lines.append(
+                    f'if "{name}" in ATTRIBUTE_NAMES: '
+                    f'ATTRIBUTE_NAMES.remove("{name}")'
+                )
+                lines.append(f'_ATTRIBUTE_STEMS.pop("{name}", None)')
+                lines.append(f'_ATTRIBUTE_PATTERNS.pop("{name}", None)')
+                lines.append(
+                    "for _t in _ATTRIBUTE_TEMPLATES.values(): "
+                    f'_t.pop("{name}", None)'
+                )
+            for etype in sorted(self.removed_classes):
+                lines.append(f'_ATTRIBUTE_TEMPLATES.pop("{etype}", None)')
+
         lines.append("")
         lines.append("# --- end generated block ---")
         return "\n".join(lines)
-
 
 # ---------------------------------------------------------------------------
 # End of the attribute-table rolling optimisation agent block (2026-10-29).
